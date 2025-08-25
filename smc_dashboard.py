@@ -467,10 +467,52 @@ def render_beginner_card(st, sc: Scenario, prob: float, atr_val: float):
 def binance_klines(symbol: str, interval: str, limit: int = 800) -> pd.DataFrame:
     yf_symbol = TICKER_MAP.get(symbol, symbol)
     yf_interval, yf_period = YF_INTERVAL.get(interval, ("60m", "365d"))
-    df = yf.download(yf_symbol, interval=yf_interval, period=yf_period, auto_adjust=False, progress=False)
+
+    df = yf.download(
+        yf_symbol,
+        interval=yf_interval,
+        period=yf_period,
+        auto_adjust=False,
+        progress=False,
+    )
+
     if df.empty:
         raise RuntimeError(f"yfinance: пустые данные для {yf_symbol} @ {yf_interval}/{yf_period}")
-    df = df.rename(columns={"Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"})
+
+    # yfinance иногда возвращает MultiIndex-колонки вида ('Open','BTC-USD'), ...
+    if isinstance(df.columns, pd.MultiIndex):
+        # если загружен один тикер — просто убираем уровень с тикером
+        df.columns = df.columns.get_level_values(0)
+
+    # приведение названий к ожидаемым
+    rename_map = {
+        "Open": "open",
+        "High": "high",
+        "Low": "low",
+        "Close": "close",
+        "Adj Close": "adj_close",
+        "Volume": "volume",
+    }
+    df = df.rename(columns=rename_map)
+
+    # оставляем только нужные столбцы; если volume нет — создадим нули
+    need_cols = ["open", "high", "low", "close", "volume"]
+    for c in need_cols:
+        if c not in df.columns:
+            if c == "volume":
+                df[c] = 0.0
+            else:
+                raise RuntimeError(f"Нет столбца '{c}' после загрузки {yf_symbol}")
+
+    # гарантируем 1D Series (на случай если кто-то вернул (n,1))
+    for c in need_cols:
+        col = df[c]
+        if isinstance(col, pd.DataFrame):
+            df[c] = col.iloc[:, 0]
+        # убедимся в типе
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # индексы во времени → UTC
     try:
         if df.index.tz is None:
             df.index = pd.to_datetime(df.index, utc=True)
@@ -478,7 +520,8 @@ def binance_klines(symbol: str, interval: str, limit: int = 800) -> pd.DataFrame
             df.index = df.index.tz_convert("UTC")
     except Exception:
         df.index = pd.to_datetime(df.index, utc=True)
-    return df[["open","high","low","close","volume"]].tail(limit)
+
+    return df[need_cols].tail(limit)
 
 # ========= Help / Guide =========
 def show_guide():
