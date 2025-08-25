@@ -3,11 +3,12 @@
 
 """
 SMC Intraday — BTC / ETH / XAUUSD / XAUEUR / EURUSD (text)
-Качественный SMC-анализ c фоллбэком источников (yfinance), выбором актива и экспортом в Pine v5.
+Качественный SMC-анализ с фоллбэком источников (yfinance), выбором актива и экспортом в Pine v5.
 """
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -21,7 +22,6 @@ import yfinance as yf
 #        Конфигурация
 # ==============================
 
-# Список активов в UI
 ASSETS = [
     "BTCUSDT",   # BTC-USD
     "ETHUSDT",   # ETH-USD
@@ -30,34 +30,34 @@ ASSETS = [
     "EURUSD",    # EURUSD
 ]
 
-# Карта кандидатов тикеров Yahoo для каждого актива (по порядку пробуем, пока не появятся свечи)
+# Кандидаты тикеров Yahoo Finance для каждого актива
 YF_TICKER_CANDIDATES: Dict[str, List[str]] = {
     "BTCUSDT": ["BTC-USD"],
     "ETHUSDT": ["ETH-USD"],
-    # XAUUSD: сначала спот курс, затем фьючерс (у фьючерса обычно есть 5m/15m)
+    # XAUUSD: сперва спот, затем фьючерс (у GC=F чаще бывают 5m/15m)
     "XAUUSD": ["XAUUSD=X", "GC=F"],
     "XAUEUR": ["XAUEUR=X"],
     "EURUSD": ["EURUSD=X"],
 }
 
-# Интервалы в UI -> интервалы Yahoo + период
-# Если выбранный tf не даёт данных для тикера — попробуем следующий по списку
+# Интервалы UI -> фоллбэки Yahoo (interval, period)
 TF_FALLBACKS = {
     "5m":  [("5m", "60d"), ("15m", "60d"), ("60m", "730d")],
     "15m": [("15m", "60d"), ("60m", "730d")],
     "1h":  [("60m", "730d"), ("1d", "730d")],
+    "1d":  [("1d", "730d")],
 }
 
-# HTF для контекста (подбираем доступные интервалы Yahoo)
+# Старший ТФ для контекста
 HTF_OF = {"5m": "15m", "15m": "60m", "1h": "1d"}
 
-# Ссылка TradingView для удобного открытия графика
+# Ссылка TradingView (можно поменять под свою биржу)
 TV_SYMBOL = {
     "BTCUSDT": "BINANCE:BTCUSDT",
     "ETHUSDT": "BINANCE:ETHUSDT",
-    "XAUUSD": "OANDA:XAUUSD",     # обычно доступен в TV
-    "XAUEUR": "OANDA:XAU_EUR",    # если нет — поменяйте на свою биржу
-    "EURUSD": "OANDA:EURUSD",
+    "XAUUSD":  "OANDA:XAUUSD",
+    "XAUEUR":  "OANDA:XAU_EUR",
+    "EURUSD":  "OANDA:EURUSD",
 }
 
 
@@ -111,13 +111,11 @@ def adx(df: pd.DataFrame, n: int = 14) -> pd.Series:
     return dx.ewm(alpha=1 / n, adjust=False).mean().fillna(20)
 
 def vwap_series(df: pd.DataFrame) -> pd.Series:
-    # Если объёмов нет (FX), VWAP деградирует к цене
     tp  = (df["high"] + df["low"] + df["close"]) / 3.0
     vol = df["volume"].replace(0, np.nan).fillna(0.0)
     num = (tp * vol).cumsum()
     den = vol.cumsum().replace(0, np.nan)
-    vw  = (num / den).fillna(method="bfill").fillna(df["close"])
-    return vw
+    return (num / den).fillna(method="bfill").fillna(df["close"])
 
 
 # ==============================
@@ -197,10 +195,19 @@ def simple_ob(df, dir_, t, back=70):
 def volume_profile(df: pd.DataFrame, bins: int = 40) -> Dict[str, float | np.ndarray]:
     lo = float(df["low"].min()); hi = float(df["high"].max())
     if hi <= lo: hi = lo + 1e-6
-    edges = np.linspace(lo, hi, bins + 1); vol = np.zeros(bins)
-    prices = df["close"].values; vols = df["volume"].values
+    edges = np.linspace(lo, hi, bins + 1)
+
+    prices = df["close"].values
+    vols = df["volume"].values.astype(float)
+    # Если объёмы отсутствуют (форекс/металлы), используем единичные «объёмы»
+    if np.nansum(vols) <= 1e-12:
+        vols = np.ones_like(vols, dtype=float)
+
+    vol = np.zeros(bins, dtype=float)
     idx = np.clip(np.digitize(prices, edges) - 1, 0, bins - 1)
-    for i, v in zip(idx, vols): vol[i] += v
+    for i, v in zip(idx, vols):
+        vol[i] += float(v)
+
     total = max(vol.sum(), 1.0)
     poc_i = int(vol.argmax()); poc = (edges[poc_i] + edges[poc_i + 1]) / 2
     area = [poc_i]; L = poc_i - 1; R = poc_i + 1; acc = vol[poc_i]
@@ -431,7 +438,7 @@ def propose(df: pd.DataFrame, htf_bias: str, d_bias: str, regime: str,
             sc.append(Scenario("POC Flip", "short", "limit", "ретест POC снизу", e, sl, tp1, tp2, rr,
                                explain_scenario("POC Flip", "short", {})))
 
-    # SFP (контр-тренд у последнего свинга)
+    # SFP
     if sh_lvl is not None and df["high"].iloc[-1] > sh_lvl and df["close"].iloc[-1] < sh_lvl:
         e = sh_lvl - 0.1 * at; sl = sh_lvl + 0.9 * at
         tp1, tp2, rr = rr_targets(e, sl, "short")
@@ -443,7 +450,6 @@ def propose(df: pd.DataFrame, htf_bias: str, d_bias: str, regime: str,
         sc.append(Scenario("SFP Reversal", "long", "stop", f"SFP у {sl_lvl:.2f}", e, sl, tp1, tp2, rr,
                            explain_scenario("SFP Reversal", "long", {"lvl": sl_lvl})))
 
-    # Сортировка по контексту
     def _sort_key(x: Scenario):
         base = 0
         if (x.name.startswith(("FVG", "BOS", "OB", "EMA", "Structure", "VWAP", "POC", "SFP")) and regime == "trend") or \
@@ -454,7 +460,6 @@ def propose(df: pd.DataFrame, htf_bias: str, d_bias: str, regime: str,
 
     sc = sorted(sc, key=_sort_key)
 
-    # Уникальность и лимит
     uniq, seen = [], set()
     for s in sc:
         k = (s.name, s.bias)
@@ -513,7 +518,7 @@ def scenario_probabilities(
 def yf_ohlc_first_success(asset_key: str, tf: str, limit: int = 800) -> Tuple[pd.DataFrame, str, str]:
     """
     Пробуем несколько тикеров и фоллбэк-интервалы для выбранного tf.
-    Возвращаем (df, фактический_interval, фактический_period)
+    Возвращаем (df, фактический_interval, фактический_period).
     """
     cands = YF_TICKER_CANDIDATES.get(asset_key, [asset_key])
     tries = TF_FALLBACKS.get(tf, TF_FALLBACKS["15m"])
@@ -521,7 +526,8 @@ def yf_ohlc_first_success(asset_key: str, tf: str, limit: int = 800) -> Tuple[pd
     for tkr in cands:
         for interval, period in tries:
             try:
-                df = yf.download(tkr, interval=interval, period=period, auto_adjust=False, progress=False)
+                df = yf.download(tkr, interval=interval, period=period,
+                                 auto_adjust=False, progress=False)
                 if df.empty:
                     last_err = f"{tkr}@{interval}/{period}: пусто"; continue
                 if isinstance(df.columns, pd.MultiIndex):
@@ -532,7 +538,6 @@ def yf_ohlc_first_success(asset_key: str, tf: str, limit: int = 800) -> Tuple[pd
                     if c not in df.columns:
                         df[c] = 0.0 if c == "volume" else np.nan
                     df[c] = pd.to_numeric(df[c], errors="coerce")
-                # TZ → UTC
                 try:
                     if df.index.tz is None: df.index = pd.to_datetime(df.index, utc=True)
                     else: df.index = df.index.tz_convert("UTC")
@@ -609,25 +614,39 @@ with colC:
 with colD:
     min_tp1_atr = st.slider("Мин. TP1 (×ATR)", 1.0, 3.0, 1.5, step=0.25)
 
+# --- Обновление данных (без перезагрузки страницы) ---
 colE, colF = st.columns([1, 1])
 with colE:
-    it = st.selectbox("Auto-refresh", ["30s", "1m", "2m", "5m"], index=3)
+    refresh_mode = st.selectbox("Обновление", ["Выключено", "Каждые 30s", "1m", "2m", "5m"], index=0)
 with colF:
-    beginner_mode = st.checkbox("Простой режим (для новичка)", value=True)
+    if st.button("🔄 Обновить сейчас"):
+        st.cache_data.clear()
+        st.toast("Данные обновлены")
+        st.experimental_rerun()
 
-st.markdown(
-    f"<meta http-equiv='refresh' content='{ {'30s':30,'1m':60,'2m':120,'5m':300}[it] }'>",
-    unsafe_allow_html=True,
-)
+INTERVALS = {"Каждые 30s": 30, "1m": 60, "2m": 120, "5m": 300}
+if "next_refresh_ts" not in st.session_state:
+    st.session_state.next_refresh_ts = time.time() + 10**9  # далеко в будущее
+if refresh_mode != "Выключено":
+    interval = INTERVALS[refresh_mode]
+    now = time.time()
+    if now >= st.session_state.next_refresh_ts:
+        st.session_state.next_refresh_ts = now + interval
+        st.cache_data.clear()
+        st.experimental_rerun()
+else:
+    st.session_state.next_refresh_ts = time.time() + 10**9
+
+beginner_mode = st.checkbox("Простой режим (для новичка)", value=True)
 
 with st.expander("📘 Справочник (нажми, чтобы открыть)"):
     st.markdown(
         "- **ATR** — диапазон для стопов/подтверждений.  "
         "- **BOS** — пробой структуры с закрытием ≥ 0.30×ATR.  \n"
         "- **FVG/OB/Breaker/SFP** — базовые SMC-паттерны.  "
-        "- **Value Area/POC** — объёмная зона (приблизительно), в боковике играем от VAL/VAH к POC.  \n"
+        "- **Value Area/POC** — приближённая объёмная зона; в боковике играем от VAL/VAH к POC.  \n"
         "- Вероятности — относительные (softmax), это ранжирование идей, а не гарантия.  \n"
-        "- В **TradingView** нельзя автоматически нанести уровни программно — используйте сгенерированный **Pine v5** (копировать → вставить в Pine-редактор)."
+        "- TradingView не даёт публичный API для автонанесения. Используй сгенерированный **Pine v5** (скопировать → вставить в Pine-редактор)."
     )
 
 st.caption(
@@ -640,25 +659,24 @@ st.caption(
 #        Основной поток
 # ==============================
 
-summary = []
+summary: List[str] = []
 
 try:
     # LTF
-    df, tf_eff, period_eff = yf_ohlc_first_success(asset, tf, limit=800)
+    df, tf_eff, _ = yf_ohlc_first_success(asset, tf, limit=800)
 
     # HTF
     htf = HTF_OF[tf]
     df_h, _, _ = yf_ohlc_first_success(asset, htf, limit=400)
 
-    # Daily (1d)
-    df_d, _, _ = yf_ohlc_first_success(asset, "1h", limit=24 * 200) if tf != "1h" else yf_ohlc_first_success(asset, "1h", limit=24 * 200)
+    # Daily
+    df_d, _, _ = yf_ohlc_first_success(asset, "1d", limit=600)
 
     price = float(df["close"].iloc[-1])
     vp = volume_profile(df)
     reg = market_regime(df, vp)
     atr_v = float(atr(df).iloc[-1])
 
-    # OBV-уклон (если нет объёмов, будет около 0)
     o = obv(df); wnd = min(len(o), 160)
     slope = (np.polyfit(np.arange(wnd), o.tail(wnd), 1)[0] if wnd >= 20 else 0.0)
 
@@ -672,8 +690,7 @@ try:
     scenarios: List[Scenario] = []
     for sc in scenarios_all:
         if sc.name.startswith("Wait"):
-            scenarios.append(sc)
-            continue
+            scenarios.append(sc); continue
         risk_ok = abs(sc.entry - sc.sl) >= min_risk
         tp1_ok = (abs(sc.tp1 - sc.entry) / max(atr_v, 1e-6)) >= min_tp1_atr
         if risk_ok and tp1_ok:
@@ -685,30 +702,28 @@ try:
 
     st.markdown(f"## {asset} ({tf}) — цена: {price:,.2f}".replace(",", " "))
 
-    ltf_b = score_bias(df); htf_b = score_bias(df_h); d_b = regime_daily(df_d)
-    top_pair = list(sc_probs.items())[0] if sc_probs else ("Wait (no-trade)", 100.0)
-    top_name, top_prob = top_pair[0], top_pair[1]
-
     def _fmt_price(x: float) -> str: return f"{x:,.2f}".replace(",", " ")
     def _fmt_pct(x: float) -> str: return f"{x:.1f}%"
     def _rr(entry: float, sl: float, tp1: float) -> float:
         risk = abs(entry - sl) or 1e-6; reward = abs(tp1 - entry); return round(reward / risk, 2)
 
+    ltf_b = score_bias(df); htf_b = score_bias(df_h); d_b = regime_daily(df_d)
     poc_state = "выше VAH" if price > vp["vah"] else ("ниже VAL" if price < vp["val"] else "внутри value area")
     st.markdown(
         f"**Контекст:** LTF={ltf_b.upper()}, HTF={htf_b.upper()}, Daily={d_b.upper()} • "
         f"Режим: {reg.upper()} (ADX≈{float(adx(df).iloc[-1]):.1f}) • "
         f"POC {vp['poc']:.2f}, VAL {vp['val']:.2f}, VAH {vp['vah']:.2f} → цена {poc_state}.  \n"
-        f"**Самый вероятный:** {top_name} ≈ {top_prob:.1f}% • "
+        f"**Самый вероятный:** {list(sc_probs.items())[0][0] if sc_probs else 'Wait'} ≈ {list(sc_probs.items())[0][1] if sc_probs else 100.0:.1f}% • "
         f"**Баланс:** LONG {bias_summary['long']:.1f}% vs SHORT {bias_summary['short']:.1f}%"
     )
 
-    # Главная карточка / Beginner
+    # Главная карточка
     if len(scenarios) == 1 and scenarios[0].name.startswith("Wait"):
         st.info("Нет понятного входа: подождать свипа/ретеста ключевых уровней.")
         main_sc = scenarios[0]; main_prob = 100.0
     else:
         main_sc = None; main_prob = 0.0
+        top_name = list(sc_probs.keys())[0] if sc_probs else "Wait (no-trade)"
         for sc in scenarios:
             key = f"{sc.name} ({sc.bias})"
             if key == top_name:
@@ -762,14 +777,18 @@ try:
         if ev_rows:
             st.dataframe(pd.DataFrame(ev_rows), use_container_width=True, hide_index=True)
 
-    # Экспорт в TradingView (ручной, без «автонакатки» — API нет)
+    # Экспорт в TradingView (ручной)
     pine_code = pine_for_scenario(asset, tf, main_sc)
     st.markdown("### Экспорт в TradingView")
     st.code(pine_code, language="pine")
+    st.download_button("⬇️ Скачать .pine", data=pine_code.encode("utf-8"),
+                       file_name=f"{asset}_{tf}_{main_sc.name.replace(' ','_')}.pine",
+                       mime="text/plain", use_container_width=False)
     st.link_button("📈 Открыть график TradingView", tv_chart_url(asset, tf_eff))
-    st.caption("Скопируйте код выше → откройте TradingView → Pine Editor → вставьте → Save → Add to chart.")
+    st.caption("Открой ссылку, вставь код в Pine Editor (New → Paste → Save), затем 'Add to chart'.")
 
-    summary.append(f"{asset} {tf} → режим {reg}; HTF {htf} bias {htf_bias}; Top: {top_name}")
+    top_line = list(sc_probs.keys())[0] if sc_probs else "Wait (no-trade)"
+    summary.append(f"{asset} {tf} → режим {reg}; HTF {htf} bias {htf_bias}; Top: {top_line}")
     st.divider()
 
 except Exception as e:
