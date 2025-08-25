@@ -3,7 +3,8 @@
 
 """
 SMC Intraday — BTC / ETH / XAUUSD / XAUEUR / EURUSD (text)
-Качественный SMC-анализ с фоллбэком источников (yfinance), выбором актива и экспортом в Pine v5.
+SMC-анализ с фоллбэком источников (yfinance), выбором актива, «тонкими» ценами
+и моделями входа на основе подтверждений (BOS/FVG/OB/EMA/OBV/VWAP/POC/SFP/Breaker).
 """
 
 from __future__ import annotations
@@ -22,25 +23,16 @@ import yfinance as yf
 #        Конфигурация
 # ==============================
 
-ASSETS = [
-    "BTCUSDT",   # BTC-USD
-    "ETHUSDT",   # ETH-USD
-    "XAUUSD",    # золото к USD
-    "XAUEUR",    # золото к EUR
-    "EURUSD",    # EURUSD
-]
+ASSETS = ["BTCUSDT", "ETHUSDT", "XAUUSD", "XAUEUR", "EURUSD"]
 
-# Кандидаты тикеров Yahoo Finance для каждого актива
 YF_TICKER_CANDIDATES: Dict[str, List[str]] = {
     "BTCUSDT": ["BTC-USD"],
     "ETHUSDT": ["ETH-USD"],
-    # XAUUSD: сперва спот, затем фьючерс (у GC=F чаще бывают 5m/15m)
-    "XAUUSD": ["XAUUSD=X", "GC=F"],
-    "XAUEUR": ["XAUEUR=X"],
-    "EURUSD": ["EURUSD=X"],
+    "XAUUSD":  ["XAUUSD=X", "GC=F"],
+    "XAUEUR":  ["XAUEUR=X"],
+    "EURUSD":  ["EURUSD=X"],
 }
 
-# Интервалы UI -> фоллбэки Yahoo (interval, period)
 TF_FALLBACKS = {
     "5m":  [("5m", "60d"), ("15m", "60d"), ("60m", "730d")],
     "15m": [("15m", "60d"), ("60m", "730d")],
@@ -48,17 +40,7 @@ TF_FALLBACKS = {
     "1d":  [("1d", "730d")],
 }
 
-# Старший ТФ для контекста
 HTF_OF = {"5m": "15m", "15m": "60m", "1h": "1d"}
-
-# Ссылка TradingView (можно поменять под свою биржу)
-TV_SYMBOL = {
-    "BTCUSDT": "BINANCE:BTCUSDT",
-    "ETHUSDT": "BINANCE:ETHUSDT",
-    "XAUUSD":  "OANDA:XAUUSD",
-    "XAUEUR":  "OANDA:XAU_EUR",
-    "EURUSD":  "OANDA:EURUSD",
-}
 
 
 # ==============================
@@ -116,6 +98,13 @@ def vwap_series(df: pd.DataFrame) -> pd.Series:
     num = (tp * vol).cumsum()
     den = vol.cumsum().replace(0, np.nan)
     return (num / den).fillna(method="bfill").fillna(df["close"])
+
+def slope(series: pd.Series, last_n: int = 80) -> float:
+    n = min(len(series), last_n)
+    if n < 8: return 0.0
+    y = series.tail(n).values
+    x = np.arange(n, dtype=float)
+    return float(np.polyfit(x, y, 1)[0])
 
 
 # ==============================
@@ -199,8 +188,7 @@ def volume_profile(df: pd.DataFrame, bins: int = 40) -> Dict[str, float | np.nda
 
     prices = df["close"].values
     vols = df["volume"].values.astype(float)
-    # Если объёмы отсутствуют (форекс/металлы), используем единичные «объёмы»
-    if np.nansum(vols) <= 1e-12:
+    if np.nansum(vols) <= 1e-12:  # форекс/металлы без объёма
         vols = np.ones_like(vols, dtype=float)
 
     vol = np.zeros(bins, dtype=float)
@@ -249,18 +237,25 @@ def market_regime(df: pd.DataFrame, vp: Dict[str, float | np.ndarray]) -> str:
     outside = (price > vp["vah"]) or (price < vp["val"])
     return "trend" if (ad >= 22 or outside) else "range"
 
+
+# ==============================
+#   Модели входа с подтверждениями
+# ==============================
+
 @dataclass
 class Scenario:
     name: str
-    bias: str
-    etype: str
-    trigger: str
+    bias: str           # long / short
+    etype: str          # limit / stop
+    trigger: str        # текстовый триггер
     entry: float
     sl: float
     tp1: float
     tp2: Optional[float]
     rr: str
     explain: str
+    confirms: int       # сколько подтверждений накоплено
+    confirm_list: List[str]
 
 def rr_targets(entry: float, sl: float, bias: str, min_rr: float = 2.0) -> Tuple[float, float, str]:
     risk = abs(entry - sl) or 1e-6
@@ -278,188 +273,144 @@ def scenario_ev(entry, sl, tp1, prob):
 def explain_scenario(name: str, bias: str, details: Dict[str, float | str]) -> str:
     side = "LONG" if bias == "long" else "SHORT"; parts = []
     if name == "FVG mitigation":
-        parts += ["Откат к середине актуального FVG по направлению BOS.",
-                  f"Подтверждение: свеча в пользу {side} после касания mid-FVG."]
+        parts += ["BOS → FVG: откат к середине актуального FVG по направлению BOS.",
+                  f"Третий сигнал — свеча в пользу {side} после касания mid-FVG."]
     elif name == "OB Retest":
-        parts += ["Ретест импульсного Order Block по тренду.",
-                  "Подтверждение: отбой у границы блока; хвосты внутри OB слабые."]
+        parts += ["BOS → OB: ретест импульсного Order Block по тренду.",
+                  "Третий сигнал — отбой/закрытие у границы блока."]
     elif name == "BOS Break & Retest":
-        lvl = details.get("lvl"); parts += [f"Пробой ключевого swing {lvl:.2f} и ретест.",
-                                            "Подтверждение: закрепление и отскок по направлению пробоя."]
+        lvl = details.get("lvl"); parts += [f"Пробой swing {lvl:.5f} и ретест (stop-entry)."]
     elif name == "Breaker":
-        lvl = details.get("lvl"); parts += [f"Свип ликвидности на {lvl:.2f} и возврат (breaker).",
-                                            "Подтверждение: ложный прокол и закрытие обратно."]
+        lvl = details.get("lvl"); parts += [f"Свип и возврат под/над {lvl:.5f} (breaker) + ретест."]
     elif name == "Value Area Reversion":
-        edge = details.get("edge"); parts += [f"От края value area ({edge}) к POC (mean-reversion).",
-                                              "Подтверждение: разворот у VAL/VAH при низком ADX."]
+        edge = details.get("edge"); parts += [f"Боковик: от {edge} к POC (mean-reversion)."]
     elif name == "EMA Pullback":
-        parts += ["Продолжение тренда через откат к EMA20.",
-                  "Подтверждение: касание EMA и возобновление импульса."]
+        parts += ["Тренд: касание EMA20 и возобновление импульса."]
     elif name == "Structure Breakout":
-        lvl = details.get("lvl"); parts += [f"Пробой последнего фрактала {lvl:.2f} и продолжение.",
-                                            "Подтверждение: ускорение без глубоких возвратов."]
+        lvl = details.get("lvl"); parts += [f"Пробой последнего свинга {lvl:.5f} и продолжение."]
     elif name == "VWAP Bounce":
-        parts += ["Откат к VWAP и отбой по тренду.",
-                  "Подтверждение: удержание VWAP и согласованный OBV."]
+        parts += ["Отбой от VWAP в сторону тренда."]
     elif name == "POC Flip":
-        parts += ["Перехват контроля на POC (flip) и ретест с обратной стороны.",
-                  "Подтверждение: POC становится поддержкой/сопротивлением."]
+        parts += ["Flip POC: ретест с обратной стороны и продолжение."]
     elif name == "SFP Reversal":
-        lvl = details.get("lvl"); parts += [f"SFP у {lvl:.2f}: прокол и закрытие обратно → вероятен реверс.",
-                                            "Подтверждение: сильная разворотная свеча; хвост больше тела."]
+        lvl = details.get("lvl"); parts += [f"SFP на {lvl:.5f}: прокол и возврат — контртренд."]
     else:
-        parts += ["Сетап по контексту и уровням."]
+        parts += ["Сетап по контексту."]
     parts.append("Отмена: сильное закрепление по другую сторону стоп-уровня.")
     return " ".join(parts)
 
 def propose(df: pd.DataFrame, htf_bias: str, d_bias: str, regime: str,
             vp: Dict[str, float | np.ndarray], obv_slope: float) -> List[Scenario]:
     price = float(df["close"].iloc[-1])
-    at = float(atr(df).iloc[-1]); at = max(at, 1e-6)
-    SH, SL = swings(df); dir_, t, _ = bos(df, SH, SL)
-    gaps = fvg(df); swp = sweeps(df, SH, SL); ob = simple_ob(df, dir_, t)
+    at = float(atr(df).iloc[-1]); at = max(at, 1e-9)
+    ema20 = float(ema(df["close"], 20).iloc[-1])
+    ema_up = slope(ema(df["close"], 20)) > 0
+    ema_dn = slope(ema(df["close"], 20)) < 0
+    above_poc = price > vp["poc"]
+
+    SH, SL = swings(df); dir_, t_bos, _ = bos(df, SH, SL)
+    gaps = fvg(df); swp = sweeps(df, SH, SL); ob = simple_ob(df, dir_, t_bos)
     sh_lvl, sl_lvl = last_swing_levels(df, SH, SL)
-    vw = float(vwap_series(df).iloc[-1]); ema20 = float(ema(df["close"], 20).iloc[-1])
+    vw = float(vwap_series(df).iloc[-1])
 
     sc: List[Scenario] = []
 
-    # FVG
-    if dir_ == "up" and gaps["bull"] and regime == "trend":
-        _, lo, hi = list(reversed(gaps["bull"]))[0]; e = (lo + hi) / 2; sl = e - 1.2 * at
-        tp1, tp2, rr = rr_targets(e, sl, "long")
-        sc.append(Scenario("FVG mitigation", "long", "limit", f"mid FVG {e:.2f}", e, sl, tp1, tp2, rr,
-                           explain_scenario("FVG mitigation", "long", {})))
-    if dir_ == "down" and gaps["bear"] and regime == "trend":
-        _, lo, hi = list(reversed(gaps["bear"]))[0]; e = (lo + hi) / 2; sl = e + 1.2 * at
-        tp1, tp2, rr = rr_targets(e, sl, "short")
-        sc.append(Scenario("FVG mitigation", "short", "limit", f"mid FVG {e:.2f}", e, sl, tp1, tp2, rr,
-                           explain_scenario("FVG mitigation", "short", {})))
+    def add(name, bias, etype, trigger, e, sl, details, base_confirms: List[str]):
+        tp1, tp2, rr = rr_targets(e, sl, bias)
+        confs = base_confirms[:]  # copy
+        # общие подтверждения
+        if bias == "long" and obv_slope > 0: confs.append("OBV↑")
+        if bias == "short" and obv_slope < 0: confs.append("OBV↓")
+        if bias == "long" and above_poc: confs.append("выше POC")
+        if bias == "short" and not above_poc: confs.append("ниже POC")
+        if bias == "long" and ema_up: confs.append("EMA20↑")
+        if bias == "short" and ema_dn: confs.append("EMA20↓")
+        sc.append(
+            Scenario(name, bias, etype, trigger, e, sl, tp1, tp2, rr,
+                     explain_scenario(name, bias, details),
+                     confirms=len(confs), confirm_list=confs)
+        )
 
-    # OB ретест
+    # ====== Модели «пакетами подтверждений» ======
+
+    # 1) BOS → FVG (ожидание 3-го сигнала: касание mid-FVG c закрытием в сторону)
+    if dir_ == "up" and gaps["bull"] and regime == "trend":
+        _, lo, hi = list(reversed(gaps["bull"]))[0]
+        e = (lo + hi) / 2; sl = e - 1.2 * at
+        add("FVG mitigation", "long", "limit", f"mid FVG {e:.5f}", e, sl, {},
+            base_confirms=["BOS↑", "FVG↑"])
+    if dir_ == "down" and gaps["bear"] and regime == "trend":
+        _, lo, hi = list(reversed(gaps["bear"]))[0]
+        e = (lo + hi) / 2; sl = e + 1.2 * at
+        add("FVG mitigation", "short", "limit", f"mid FVG {e:.5f}", e, sl, {},
+            base_confirms=["BOS↓", "FVG↓"])
+
+    # 2) BOS → OB ретест (3-й сигнал — отбой у границы)
     if dir_ == "up" and ob.get("demand") and regime == "trend":
         _, lo, hi = ob["demand"]; e = hi; sl = lo - 0.6 * at
-        tp1, tp2, rr = rr_targets(e, sl, "long")
-        sc.append(Scenario("OB Retest", "long", "limit", f"retest OB {lo:.2f}-{hi:.2f}", e, sl, tp1, tp2, rr,
-                           explain_scenario("OB Retest", "long", {})))
+        add("OB Retest", "long", "limit", f"retest OB {lo:.5f}-{hi:.5f}", e, sl, {}, ["BOS↑", "OB(demand)"])
     if dir_ == "down" and ob.get("supply") and regime == "trend":
         _, lo, hi = ob["supply"]; e = lo; sl = hi + 0.6 * at
-        tp1, tp2, rr = rr_targets(e, sl, "short")
-        sc.append(Scenario("OB Retest", "short", "limit", f"retest OB {lo:.2f}-{hi:.2f}", e, sl, tp1, tp2, rr,
-                           explain_scenario("OB Retest", "short", {})))
+        add("OB Retest", "short", "limit", f"retest OB {lo:.5f}-{hi:.5f}", e, sl, {}, ["BOS↓", "OB(supply)"])
 
-    # BOS + ретест
-    if dir_ == "up" and t is not None:
-        lvl = float(df.loc[t, "high"]); e = lvl + 0.2 * at; sl = lvl - 0.8 * at
-        tp1, tp2, rr = rr_targets(e, sl, "long")
-        sc.append(Scenario("BOS Break & Retest", "long", "stop", f"пробой {lvl:.2f}+ретест", e, sl, tp1, tp2, rr,
-                           explain_scenario("BOS Break & Retest", "long", {"lvl": lvl})))
-    if dir_ == "down" and t is not None:
-        lvl = float(df.loc[t, "low"]); e = lvl - 0.2 * at; sl = lvl + 0.8 * at
-        tp1, tp2, rr = rr_targets(e, sl, "short")
-        sc.append(Scenario("BOS Break & Retest", "short", "stop", f"пробой {lvl:.2f}+ретест", e, sl, tp1, tp2, rr,
-                           explain_scenario("BOS Break & Retest", "short", {"lvl": lvl})))
-
-    # Breaker (после свипа)
+    # 3) Breaker: свип → BOS в обратную → ретест
     if swp["high"] and dir_ == "down":
-        _, lvl_s = swp["high"][-1]; e = lvl_s - 0.1 * at; sl = lvl_s + 0.7 * at
-        tp1, tp2, rr = rr_targets(e, sl, "short")
-        sc.append(Scenario("Breaker", "short", "stop", f"breaker после свипа {lvl_s:.2f}", e, sl, tp1, tp2, rr,
-                           explain_scenario("Breaker", "short", {"lvl": lvl_s})))
+        _, lvl = swp["high"][-1]; e = lvl - 0.1 * at; sl = lvl + 0.7 * at
+        add("Breaker", "short", "stop", f"breaker после свипа {lvl:.5f}", e, sl, {"lvl": lvl}, ["SFP/Свип", "BOS↓"])
     if swp["low"] and dir_ == "up":
-        _, lvl_s = swp["low"][-1]; e = lvl_s + 0.1 * at; sl = lvl_s - 0.7 * at
-        tp1, tp2, rr = rr_targets(e, sl, "long")
-        sc.append(Scenario("Breaker", "long", "stop", f"breaker после свипа {lvl_s:.2f}", e, sl, tp1, tp2, rr,
-                           explain_scenario("Breaker", "long", {"lvl": lvl_s})))
+        _, lvl = swp["low"][-1]; e = lvl + 0.1 * at; sl = lvl - 0.7 * at
+        add("Breaker", "long", "stop", f"breaker после свипа {lvl:.5f}", e, sl, {"lvl": lvl}, ["SFP/Свип", "BOS↑"])
 
-    # Диапазон: VAL/VAH → POC
-    if regime == "range":
+    # 4) Диапазон: у края VA + ADX низкий + отбой (3+ сигнала)
+    adx_val = float(adx(df).iloc[-1])
+    if regime == "range" and adx_val < 22:
         if abs(price - vp["val"]) <= max(0.6 * at, 0.1 * (vp["vah"] - vp["val"])):
             e = vp["val"] + 0.1 * at; sl = vp["val"] - 0.8 * at
-            tp1, tp2, rr = rr_targets(e, sl, "long")
-            sc.append(Scenario("Value Area Reversion", "long", "limit", "от VAL к POC", e, sl, tp1, tp2, rr,
-                               explain_scenario("Value Area Reversion", "long", {"edge": "VAL"})))
+            add("Value Area Reversion", "long", "limit", "от VAL к POC", e, sl, {"edge": "VAL"}, ["VA edge", "ADX низкий"])
         if abs(price - vp["vah"]) <= max(0.6 * at, 0.1 * (vp["vah"] - vp["val"])):
             e = vp["vah"] - 0.1 * at; sl = vp["vah"] + 0.8 * at
-            tp1, tp2, rr = rr_targets(e, sl, "short")
-            sc.append(Scenario("Value Area Reversion", "short", "limit", "от VAH к POC", e, sl, tp1, tp2, rr,
-                               explain_scenario("Value Area Reversion", "short", {"edge": "VAH"})))
+            add("Value Area Reversion", "short", "limit", "от VAH к POC", e, sl, {"edge": "VAH"}, ["VA edge", "ADX низкий"])
 
-    # EMA pullback
+    # 5) EMA pullback: тренд + касание EMA20 (3-й — свеча в сторону)
     if regime == "trend" and price > ema20:
         e = ema20; sl = e - 1.2 * at
-        tp1, tp2, rr = rr_targets(e, sl, "long")
-        sc.append(Scenario("EMA Pullback", "long", "limit", f"к EMA20 {e:.2f}", e, sl, tp1, tp2, rr,
-                           explain_scenario("EMA Pullback", "long", {})))
+        add("EMA Pullback", "long", "limit", f"к EMA20 {e:.5f}", e, sl, {}, ["тренд", "EMA20"])
     if regime == "trend" and price < ema20:
         e = ema20; sl = e + 1.2 * at
-        tp1, tp2, rr = rr_targets(e, sl, "short")
-        sc.append(Scenario("EMA Pullback", "short", "limit", f"к EMA20 {e:.2f}", e, sl, tp1, tp2, rr,
-                           explain_scenario("EMA Pullback", "short", {})))
+        add("EMA Pullback", "short", "limit", f"к EMA20 {e:.5f}", e, sl, {}, ["тренд", "EMA20"])
 
-    # Structure Breakout / Breakdown
+    # 6) Structure breakout: пробой последнего свинга + ретест
     if sh_lvl is not None:
         base_sl = (sl_lvl if sl_lvl is not None else price - 1.2 * at)
         e = sh_lvl + 0.2 * at; sl = base_sl - 0.4 * at
-        tp1, tp2, rr = rr_targets(e, sl, "long")
-        sc.append(Scenario("Structure Breakout", "long", "stop",
-                           f"breakout swing-high {sh_lvl:.2f}", e, sl, tp1, tp2, rr,
-                           explain_scenario("Structure Breakout", "long", {"lvl": sh_lvl})))
+        add("Structure Breakout", "long", "stop",
+            f"breakout swing-high {sh_lvl:.5f}", e, sl, {"lvl": sh_lvl}, ["уровень swing↑", "ret"])
     if sl_lvl is not None:
         base_sl = (sh_lvl if sh_lvl is not None else price + 1.2 * at)
         e = sl_lvl - 0.2 * at; sl = base_sl + 0.4 * at
-        tp1, tp2, rr = rr_targets(e, sl, "short")
-        sc.append(Scenario("Structure Breakout", "short", "stop",
-                           f"breakdown swing-low {sl_lvl:.2f}", e, sl, tp1, tp2, rr,
-                           explain_scenario("Structure Breakout", "short", {"lvl": sl_lvl})))
+        add("Structure Breakout", "short", "stop",
+            f"breakdown swing-low {sl_lvl:.5f}", e, sl, {"lvl": sl_lvl}, ["уровень swing↓", "ret"])
 
-    # VWAP bounce/flip
-    if abs(price - vw) <= 1.2 * at:
-        if obv_slope > 0:
-            e = vw; sl = e - 1.0 * at
-            tp1, tp2, rr = rr_targets(e, sl, "long")
-            sc.append(Scenario("VWAP Bounce", "long", "limit", f"от VWAP {vw:.2f}", e, sl, tp1, tp2, rr,
-                               explain_scenario("VWAP Bounce", "long", {})))
-        if obv_slope < 0:
-            e = vw; sl = e + 1.0 * at
-            tp1, tp2, rr = rr_targets(e, sl, "short")
-            sc.append(Scenario("VWAP Bounce", "short", "limit", f"от VWAP {vw:.2f}", e, sl, tp1, tp2, rr,
-                               explain_scenario("VWAP Bounce", "short", {})))
+    # 7) VWAP bounce / POC flip как доп-подтверждение
+    for s in list(sc):  # усиление подтверждений
+        if abs(price - vw) <= 1.2 * at:
+            s.confirm_list.append("VWAP")
+        if (s.bias == "long" and price > vp["poc"]) or (s.bias == "short" and price < vp["poc"]):
+            s.confirm_list.append("POC side")
+        s.confirms = len(s.confirm_list)
 
-    # POC flip
-    if abs(price - vp["poc"]) <= 0.6 * at:
-        if price > vp["poc"]:
-            e = vp["poc"] + 0.1 * at; sl = vp["poc"] - 0.7 * at
-            tp1, tp2, rr = rr_targets(e, sl, "long")
-            sc.append(Scenario("POC Flip", "long", "limit", "ретест POC сверху", e, sl, tp1, tp2, rr,
-                               explain_scenario("POC Flip", "long", {})))
-        else:
-            e = vp["poc"] - 0.1 * at; sl = vp["poc"] + 0.7 * at
-            tp1, tp2, rr = rr_targets(e, sl, "short")
-            sc.append(Scenario("POC Flip", "short", "limit", "ретест POC снизу", e, sl, tp1, tp2, rr,
-                               explain_scenario("POC Flip", "short", {})))
-
-    # SFP
-    if sh_lvl is not None and df["high"].iloc[-1] > sh_lvl and df["close"].iloc[-1] < sh_lvl:
-        e = sh_lvl - 0.1 * at; sl = sh_lvl + 0.9 * at
-        tp1, tp2, rr = rr_targets(e, sl, "short")
-        sc.append(Scenario("SFP Reversal", "short", "stop", f"SFP у {sh_lvl:.2f}", e, sl, tp1, tp2, rr,
-                           explain_scenario("SFP Reversal", "short", {"lvl": sh_lvl})))
-    if sl_lvl is not None and df["low"].iloc[-1] < sl_lvl and df["close"].iloc[-1] > sl_lvl:
-        e = sl_lvl + 0.1 * at; sl = sl_lvl - 0.9 * at
-        tp1, tp2, rr = rr_targets(e, sl, "long")
-        sc.append(Scenario("SFP Reversal", "long", "stop", f"SFP у {sl_lvl:.2f}", e, sl, tp1, tp2, rr,
-                           explain_scenario("SFP Reversal", "long", {"lvl": sl_lvl})))
-
+    # сортировка с учётом контекста и числа подтверждений
     def _sort_key(x: Scenario):
-        base = 0
-        if (x.name.startswith(("FVG", "BOS", "OB", "EMA", "Structure", "VWAP", "POC", "SFP")) and regime == "trend") or \
+        base = -x.confirms
+        if (x.name.startswith(("FVG", "BOS", "OB", "EMA", "Structure")) and regime == "trend") or \
            (x.name.startswith(("Value Area", "Breaker")) and regime == "range"):
-            base -= 2
-        if x.bias == htf_bias: base -= 1
+            base -= 1
+        if x.bias == htf_bias: base -= 0.5
         return base
 
     sc = sorted(sc, key=_sort_key)
 
+    # делаем уникальными по (name, bias)
     uniq, seen = [], set()
     for s in sc:
         k = (s.name, s.bias)
@@ -468,8 +419,8 @@ def propose(df: pd.DataFrame, htf_bias: str, d_bias: str, regime: str,
         if len(uniq) >= 8: break
     if not uniq:
         c = price
-        uniq.append(Scenario("Wait (no-trade)", "none", "—", "нет валидных сетапов", c, c, c, c, "—",
-                             "Пауза: дождаться свипа/ретеста ключевых уровней."))
+        uniq.append(Scenario("Wait (no-trade)", "none", "—", "нет валидных сетапов",
+                             c, c, c, c, "—", "Пауза: дождаться свипа/ретеста ключевых уровней.", 0, []))
     return uniq
 
 def scenario_probabilities(
@@ -481,22 +432,16 @@ def scenario_probabilities(
     scores, labels = [], []
     for s in scen:
         if s.name.startswith("Wait"): continue
-        sc = 0.0
-        if s.bias == htf_bias: sc += 2.2
-        if s.bias == d_bias:  sc += 1.2
-        sc += 0.9 if (obv_slope > 0 and s.bias == "long") or (obv_slope < 0 and s.bias == "short") else -0.2
-        if (s.name.startswith(("FVG","BOS","OB","EMA","Structure","POC","VWAP","SFP")) and regime == "trend") or \
+        sc = 0.3 * s.confirms  # <-- вес подтверждений
+        if s.bias == htf_bias: sc += 2.0
+        if s.bias == d_bias:  sc += 1.0
+        sc += 0.8 if (obv_slope > 0 and s.bias == "long") or (obv_slope < 0 and s.bias == "short") else -0.2
+        if (s.name.startswith(("FVG","BOS","OB","EMA","Structure")) and regime == "trend") or \
            (s.name.startswith(("Value Area","Breaker")) and regime == "range"): sc += 1.0
         if regime == "range" and s.name.startswith("Structure"): sc -= 0.6
         dist = abs(s.entry - price) / max(atr_val, 1e-6)
         if dist > 2.0: sc -= 1.0
         elif dist > 1.5: sc -= 0.5
-        above_poc = price > vp["poc"]
-        if s.name.startswith(("FVG","BOS","OB","EMA","Structure","POC Flip","VWAP","SFP")):
-            sc += 0.4 if (above_poc and s.bias == "long") or ((not above_poc) and s.bias == "short") else 0.0
-        if s.name.startswith("Value Area"):
-            near_edge = min(abs(price - vp["val"]), abs(price - vp["vah"])) <= 0.8 * atr_val
-            sc += 0.5 if near_edge else -0.2
         scores.append(sc); labels.append((s.name, s.bias))
     if not scores: return {"Wait (no-trade)": 100.0}, {"long": 0.0, "short": 0.0}
     scores = np.array(scores, dtype=float) / temp
@@ -516,10 +461,6 @@ def scenario_probabilities(
 
 @st.cache_data(show_spinner=False, ttl=60)
 def yf_ohlc_first_success(asset_key: str, tf: str, limit: int = 800) -> Tuple[pd.DataFrame, str, str]:
-    """
-    Пробуем несколько тикеров и фоллбэк-интервалы для выбранного tf.
-    Возвращаем (df, фактический_interval, фактический_period).
-    """
     cands = YF_TICKER_CANDIDATES.get(asset_key, [asset_key])
     tries = TF_FALLBACKS.get(tf, TF_FALLBACKS["15m"])
     last_err = None
@@ -552,49 +493,31 @@ def yf_ohlc_first_success(asset_key: str, tf: str, limit: int = 800) -> Tuple[pd
                 continue
     raise RuntimeError(f"yfinance: не удалось получить данные для {asset_key}. Последняя ошибка: {last_err}")
 
-def tv_chart_url(asset_key: str, tf_effective: str) -> str:
-    interval_map = {"5m":"5","15m":"15","60m":"60","1d":"D"}
-    sym = TV_SYMBOL.get(asset_key, asset_key)
-    itv = interval_map.get(tf_effective, "15")
-    return f"https://www.tradingview.com/chart/?symbol={sym}&interval={itv}"
 
-def pine_for_scenario(asset_key: str, tf_label: str, sc: Scenario) -> str:
-    """Pine v5 для отрисовки Entry/SL/TP на графике TradingView."""
-    side = "LONG" if sc.bias == "long" else "SHORT"
-    return f"""//@version=5
-indicator("SMC Idea — {asset_key} {tf_label} — {sc.name} ({side})", overlay=true)
+# ==============================
+#          Вспомогалка UI
+# ==============================
 
-// ---- levels ----
-var float entry = {sc.entry}
-var float sl    = {sc.sl}
-var float tp1   = {sc.tp1}
-var float tp2   = {('na' if sc.tp2 is None else sc.tp2)}
-var string side = "{side}"
-var string name = "{sc.name}"
+def infer_decimals(df: pd.DataFrame, asset: str) -> int:
+    # Пытаемся угадать точность по минимальному шагу последних закрытий
+    x = df["close"].tail(300).diff().abs()
+    step = float(np.nanmin(x[x > 0])) if np.any(x > 0) else 0.0
+    if step > 0:
+        p = max(2, min(6, int(np.ceil(-np.log10(step)) + 1)))
+    else:
+        # запасной вариант по активу
+        default = {"EURUSD": 5, "XAUEUR": 5, "XAUUSD": 2, "BTCUSDT": 2, "ETHUSDT": 2}
+        p = default.get(asset, 4)
+    return p
 
-// ---- plot ----
-plot(entry, "ENTRY", color.new(color.teal, 0), 2)
-plot(sl,    "SL",    color.new(color.red, 0), 2)
-plot(tp1,   "TP1",   color.new(color.green, 0), 2)
-plot(tp2,   "TP2",   color.new(color.green, 40), 2)
-
-if barstate.islast
-    label.new(bar_index, entry, "ENTRY\\n" + str.tostring(entry, format.mintick), style=label.style_label_left, color=color.teal, textcolor=color.white)
-    label.new(bar_index, sl,    "SL\\n"    + str.tostring(sl,    format.mintick), style=label.style_label_left, color=color.red,  textcolor=color.white)
-    label.new(bar_index, tp1,   "TP1\\n"   + str.tostring(tp1,   format.mintick), style=label.style_label_left, color=color.green,textcolor=color.white)
-    if not na(tp2)
-        label.new(bar_index, tp2, "TP2\\n" + str.tostring(tp2,   format.mintick), style=label.style_label_left, color=color.new(color.green,40), textcolor=color.white)
-
-rr = math.abs(tp1 - entry) / math.abs(entry - sl)
-txt = name + " (" + side + ")\\n" +
-      "Entry: " + str.tostring(entry, format.mintick) + "\\n" +
-      "SL: "    + str.tostring(sl,    format.mintick) + "\\n" +
-      "TP1: "   + str.tostring(tp1,   format.mintick) + "\\n" +
-      "TP2: "   + (na(tp2) ? "—" : str.tostring(tp2, format.mintick)) + "\\n" +
-      "R:R to TP1 ≈ " + str.tostring(rr, format.mintick)
-if barstate.islast
-    label.new(bar_index, high, txt, style=label.style_label_upper_left, textcolor=color.white, color=color.new(color.black, 0))
-"""
+def fmt_price(x: float, decimals: int) -> str:
+    s = f"{x:.{decimals}f}"
+    # красивый пробел для тысяч (только если есть целые тысячи)
+    if "." in s:
+        a, b = s.split(".")
+        a = f"{int(a):,}".replace(",", " ")
+        return f"{a}.{b}"
+    return f"{int(float(s)):,}".replace(",", " ")
 
 
 # ==============================
@@ -604,36 +527,33 @@ if barstate.islast
 st.set_page_config(page_title="SMC Intraday (text)", layout="wide")
 st.title("SMC Intraday — BTC / ETH / XAUUSD / XAUEUR / EURUSD (text)")
 
-colA, colB, colC, colD = st.columns([1.2, 1, 1, 1])
+colA, colB, colC, colD, colE = st.columns([1.2, 1, 1, 1, 1])
 with colA:
-    asset = st.selectbox("Актив", ASSETS, index=0)
+    asset = st.selectbox("Актив", ASSETS, index=4 if "EURUSD" in ASSETS else 0)
 with colB:
     tf = st.selectbox("TF", ["5m", "15m", "1h"], index=0)
 with colC:
     min_risk_pct = st.slider("Мин. риск (%ATR)", 5, 60, 25, step=5)
 with colD:
     min_tp1_atr = st.slider("Мин. TP1 (×ATR)", 1.0, 3.0, 1.5, step=0.25)
-
-# --- Обновление данных (без перезагрузки страницы) ---
-colE, colF = st.columns([1, 1])
 with colE:
-    refresh_mode = st.selectbox("Обновление", ["Выключено", "Каждые 30s", "1m", "2m", "5m"], index=0)
+    min_confirms = st.slider("Мин. подтверждений", 2, 5, 3, step=1)
+
+colF, colG = st.columns([1, 1])
 with colF:
+    refresh_mode = st.selectbox("Обновление", ["Выключено", "Каждые 30s", "1m", "2m", "5m"], index=0)
+with colG:
     if st.button("🔄 Обновить сейчас"):
-        st.cache_data.clear()
-        st.toast("Данные обновлены")
-        st.experimental_rerun()
+        st.cache_data.clear(); st.toast("Данные обновлены"); st.experimental_rerun()
 
 INTERVALS = {"Каждые 30s": 30, "1m": 60, "2m": 120, "5m": 300}
 if "next_refresh_ts" not in st.session_state:
-    st.session_state.next_refresh_ts = time.time() + 10**9  # далеко в будущее
+    st.session_state.next_refresh_ts = time.time() + 10**9
 if refresh_mode != "Выключено":
-    interval = INTERVALS[refresh_mode]
-    now = time.time()
+    interval = INTERVALS[refresh_mode]; now = time.time()
     if now >= st.session_state.next_refresh_ts:
         st.session_state.next_refresh_ts = now + interval
-        st.cache_data.clear()
-        st.experimental_rerun()
+        st.cache_data.clear(); st.experimental_rerun()
 else:
     st.session_state.next_refresh_ts = time.time() + 10**9
 
@@ -641,16 +561,15 @@ beginner_mode = st.checkbox("Простой режим (для новичка)",
 
 with st.expander("📘 Справочник (нажми, чтобы открыть)"):
     st.markdown(
-        "- **ATR** — диапазон для стопов/подтверждений.  "
-        "- **BOS** — пробой структуры с закрытием ≥ 0.30×ATR.  \n"
-        "- **FVG/OB/Breaker/SFP** — базовые SMC-паттерны.  "
-        "- **Value Area/POC** — приближённая объёмная зона; в боковике играем от VAL/VAH к POC.  \n"
-        "- Вероятности — относительные (softmax), это ранжирование идей, а не гарантия.  \n"
-        "- TradingView не даёт публичный API для автонанесения. Используй сгенерированный **Pine v5** (скопировать → вставить в Pine-редактор)."
+        "- **Модель подтверждений.** Идея набирает очки: BOS, FVG/имбаланс, OB-ретест, EMA/OBV согласование, положение к POC/VWAP, "
+        "сигналы SFP/Breaker, режим рынка. В таблице видно сколько подтверждений и какие именно. "
+        "Можно задать **минимум подтверждений** (по умолчанию 3).  \n"
+        "- **ATR** используется для стопов/фильтров и подтверждения BOS (≥0.30×ATR).  "
+        "- Вероятности — относительные (softmax), это ранжирование идей, а не гарантия."
     )
 
 st.caption(
-    "Сценарии с риском ниже порога %ATR и с TP1 меньше заданного множителя ATR скрываются. "
+    "Идеи с риском ниже порога %ATR и с TP1 меньше заданного множителя ATR скрываются. "
     "TP1=2R, TP2=3R. Вероятности нормированы (<100%)."
 )
 
@@ -662,133 +581,98 @@ st.caption(
 summary: List[str] = []
 
 try:
-    # LTF
+    # LTF / HTF / Daily
     df, tf_eff, _ = yf_ohlc_first_success(asset, tf, limit=800)
-
-    # HTF
-    htf = HTF_OF[tf]
-    df_h, _, _ = yf_ohlc_first_success(asset, htf, limit=400)
-
-    # Daily
+    htf = HTF_OF[tf]; df_h, _, _ = yf_ohlc_first_success(asset, htf, limit=400)
     df_d, _, _ = yf_ohlc_first_success(asset, "1d", limit=600)
 
     price = float(df["close"].iloc[-1])
-    vp = volume_profile(df)
-    reg = market_regime(df, vp)
+    vp = volume_profile(df); reg = market_regime(df, vp)
     atr_v = float(atr(df).iloc[-1])
+    obv_s = slope(obv(df), 160)
 
-    o = obv(df); wnd = min(len(o), 160)
-    slope = (np.polyfit(np.arange(wnd), o.tail(wnd), 1)[0] if wnd >= 20 else 0.0)
+    htf_bias = score_bias(df_h); d_bias = regime_daily(df_d)
+    scenarios_all = propose(df, htf_bias, d_bias, reg, vp, obv_s)
 
-    htf_bias = score_bias(df_h)
-    d_bias = regime_daily(df_d)
-
-    scenarios_all = propose(df, htf_bias, d_bias, reg, vp, slope)
-
-    # Фильтры
+    # фильтры
     min_risk = atr_v * (min_risk_pct / 100.0)
     scenarios: List[Scenario] = []
     for sc in scenarios_all:
         if sc.name.startswith("Wait"):
-            scenarios.append(sc); continue
+            continue
+        if sc.confirms < min_confirms:
+            continue
         risk_ok = abs(sc.entry - sc.sl) >= min_risk
         tp1_ok = (abs(sc.tp1 - sc.entry) / max(atr_v, 1e-6)) >= min_tp1_atr
         if risk_ok and tp1_ok:
             scenarios.append(sc)
-    if not [x for x in scenarios if not x.name.startswith("Wait")]:
-        scenarios = scenarios_all
+    if not scenarios:
+        scenarios = [s for s in scenarios_all if not s.name.startswith("Wait")] or scenarios_all
 
-    sc_probs, bias_summary = scenario_probabilities(scenarios, htf_bias, d_bias, slope, price, vp, atr_v, reg)
+    sc_probs, bias_summary = scenario_probabilities(scenarios, htf_bias, d_bias, obv_s, price, vp, atr_v, reg)
 
-    st.markdown(f"## {asset} ({tf}) — цена: {price:,.2f}".replace(",", " "))
-
-    def _fmt_price(x: float) -> str: return f"{x:,.2f}".replace(",", " ")
-    def _fmt_pct(x: float) -> str: return f"{x:.1f}%"
-    def _rr(entry: float, sl: float, tp1: float) -> float:
-        risk = abs(entry - sl) or 1e-6; reward = abs(tp1 - entry); return round(reward / risk, 2)
+    decimals = infer_decimals(df, asset)
+    st.markdown(f"## {asset} ({tf}) — цена: {fmt_price(price, decimals)}")
 
     ltf_b = score_bias(df); htf_b = score_bias(df_h); d_b = regime_daily(df_d)
     poc_state = "выше VAH" if price > vp["vah"] else ("ниже VAL" if price < vp["val"] else "внутри value area")
     st.markdown(
         f"**Контекст:** LTF={ltf_b.upper()}, HTF={htf_b.upper()}, Daily={d_b.upper()} • "
         f"Режим: {reg.upper()} (ADX≈{float(adx(df).iloc[-1]):.1f}) • "
-        f"POC {vp['poc']:.2f}, VAL {vp['val']:.2f}, VAH {vp['vah']:.2f} → цена {poc_state}.  \n"
-        f"**Самый вероятный:** {list(sc_probs.items())[0][0] if sc_probs else 'Wait'} ≈ {list(sc_probs.items())[0][1] if sc_probs else 100.0:.1f}% • "
+        f"POC {fmt_price(vp['poc'], decimals)}, VAL {fmt_price(vp['val'], decimals)}, VAH {fmt_price(vp['vah'], decimals)} → цена {poc_state}.  \n"
         f"**Баланс:** LONG {bias_summary['long']:.1f}% vs SHORT {bias_summary['short']:.1f}%"
     )
 
-    # Главная карточка
-    if len(scenarios) == 1 and scenarios[0].name.startswith("Wait"):
+    # основная карточка
+    if not scenarios:
         st.info("Нет понятного входа: подождать свипа/ретеста ключевых уровней.")
-        main_sc = scenarios[0]; main_prob = 100.0
+        main_sc = None
     else:
-        main_sc = None; main_prob = 0.0
-        top_name = list(sc_probs.keys())[0] if sc_probs else "Wait (no-trade)"
-        for sc in scenarios:
-            key = f"{sc.name} ({sc.bias})"
-            if key == top_name:
-                main_sc = sc; main_prob = sc_probs.get(key, 0.0); break
-        if main_sc is None:
-            main_sc = [x for x in scenarios if not x.name.startswith("Wait")][0]
-            main_prob = sc_probs.get(f"{main_sc.name} ({main_sc.bias})", 0.0)
+        top_name = list(sc_probs.keys())[0] if sc_probs else f"{scenarios[0].name} ({scenarios[0].bias})"
+        main_sc = next((s for s in scenarios if f"{s.name} ({s.bias})" == top_name), scenarios[0])
 
-    if beginner_mode:
-        rr_to_tp1 = _rr(main_sc.entry, main_sc.sl, main_sc.tp1)
-        st.markdown(f"### Что сделать сейчас — {'ПОКУПКА (LONG)' if main_sc.bias=='long' else 'ПРОДАЖА (SHORT)'}")
-        st.markdown(
-            "- **Почему:** " + main_sc.explain + "\n"
-            f"- **Вход:** {_fmt_price(main_sc.entry)}  \n"
-            f"- **Стоп:** {_fmt_price(main_sc.sl)} (риск ≈ {_fmt_price(abs(main_sc.entry-main_sc.sl))}, ~{_fmt_price(atr_v)} по цене (ATR))  \n"
-            f"- **Цели:** TP1 {_fmt_price(main_sc.tp1)} (R:R≈{rr_to_tp1}), "
-            + (f"TP2 {_fmt_price(main_sc.tp2)}  " if main_sc.tp2 else "без TP2  ")
-            + f"• **вероятность:** {_fmt_pct(main_prob)}\n"
-            "- **Не входить, если:** импульс ушёл далеко и стоп становится чрезмерным, "
-              "или цена закрепилась за уровнем, который должен был удерживаться."
-        )
-    else:
-        st.markdown("### Основные сценарии по убыванию вероятности")
+        if beginner_mode:
+            rr_to_tp1 = round(abs(main_sc.tp1 - main_sc.entry) / max(abs(main_sc.entry - main_sc.sl), 1e-9), 2)
+            st.markdown(f"### Что сделать сейчас — {'ПОКУПКА (LONG)' if main_sc.bias=='long' else 'ПРОДАЖА (SHORT)'}")
+            st.markdown(
+                "- **Почему:** " + main_sc.explain + "\n"
+                f"- **Подтверждений:** {main_sc.confirms} — {', '.join(main_sc.confirm_list)}  \n"
+                f"- **Вход:** {fmt_price(main_sc.entry, decimals)}  \n"
+                f"- **Стоп:** {fmt_price(main_sc.sl, decimals)} (риск ≈ {fmt_price(abs(main_sc.entry-main_sc.sl), decimals)}, "
+                f"~{fmt_price(atr_v, decimals)} по цене (ATR))  \n"
+                f"- **Цели:** TP1 {fmt_price(main_sc.tp1, decimals)} (R:R≈{rr_to_tp1}), "
+                + (f"TP2 {fmt_price(main_sc.tp2, decimals)}  " if main_sc.tp2 else "без TP2  ")
+            )
 
-    # Таблица
+    # таблица
     rows = []
     for sc in scenarios:
-        if sc.name.startswith("Wait"): continue
         key = f"{sc.name} ({sc.bias})"
         rows.append({
             "Сценарий": key,
             "Тип": sc.etype,
-            "Вход": _fmt_price(sc.entry),
-            "Стоп": _fmt_price(sc.sl),
-            "TP1": _fmt_price(sc.tp1),
-            "TP2": _fmt_price(sc.tp2) if sc.tp2 else "—",
-            "R:R до TP1": _rr(sc.entry, sc.sl, sc.tp1),
+            "Подтв.": f"{sc.confirms} — {', '.join(sc.confirm_list)}",
+            "Вход": fmt_price(sc.entry, decimals),
+            "Стоп": fmt_price(sc.sl, decimals),
+            "TP1": fmt_price(sc.tp1, decimals),
+            "TP2": fmt_price(sc.tp2, decimals) if sc.tp2 else "—",
+            "R:R до TP1": round(abs(sc.tp1 - sc.entry) / max(abs(sc.entry - sc.sl), 1e-9), 2),
             "Prob%": round(sc_probs.get(key, 0.0), 2),
         })
     if rows:
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-    # EV
+    # EV (по желанию)
     with st.expander("Показать математику (EV)"):
         ev_rows = []
         for sc in scenarios:
-            if sc.name.startswith("Wait"): continue
             key = f"{sc.name} ({sc.bias})"; p = sc_probs.get(key, 0.0) / 100.0
             ev_rows.append({"Сценарий": key, "Prob%": round(p * 100, 2),
                             "EV": round(scenario_ev(sc.entry, sc.sl, sc.tp1, p), 6)})
         if ev_rows:
             st.dataframe(pd.DataFrame(ev_rows), use_container_width=True, hide_index=True)
 
-    # Экспорт в TradingView (ручной)
-    pine_code = pine_for_scenario(asset, tf, main_sc)
-    st.markdown("### Экспорт в TradingView")
-    st.code(pine_code, language="pine")
-    st.download_button("⬇️ Скачать .pine", data=pine_code.encode("utf-8"),
-                       file_name=f"{asset}_{tf}_{main_sc.name.replace(' ','_')}.pine",
-                       mime="text/plain", use_container_width=False)
-    st.link_button("📈 Открыть график TradingView", tv_chart_url(asset, tf_eff))
-    st.caption("Открой ссылку, вставь код в Pine Editor (New → Paste → Save), затем 'Add to chart'.")
-
-    top_line = list(sc_probs.keys())[0] if sc_probs else "Wait (no-trade)"
-    summary.append(f"{asset} {tf} → режим {reg}; HTF {htf} bias {htf_bias}; Top: {top_line}")
+    summary.append(f"{asset} {tf} → режим {reg}; HTF {htf} bias {htf_bias}; идеи: {len(scenarios)} (мин. подтверждений {min_confirms})")
     st.divider()
 
 except Exception as e:
