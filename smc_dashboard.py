@@ -126,6 +126,12 @@ def volume_profile(df: pd.DataFrame, bins: int = 40) -> Dict[str, float | np.nda
     vah = edges[min(max(area) + 1, bins)]
     return {"edges": edges, "volume": vol, "poc": float(poc), "val": float(val), "vah": float(vah)}
 
+def liquidity_pools(df, SH, SL, win=260):
+    rec = df.iloc[-win:]
+    bsl = [(t, float(df.loc[t, "high"])) for t in rec[SH.loc[rec.index]].index]
+    ssl = [(t, float(df.loc[t, "low"])) for t in rec[SL.loc[rec.index]].index]
+    return {"BSL": bsl, "SSL": ssl}
+
 # ======== VWAP (по окну df) ========
 def vwap_series(df: pd.DataFrame) -> pd.Series:
     tp = (df["high"] + df["low"] + df["close"]) / 3.0
