@@ -2,25 +2,32 @@
 # -*- coding: utf-8 -*-
 
 """
-SMC Intraday — BTC / ETH / XAUUSD / XAUEUR / EURUSD (text)
-Надёжные SMC-сигналы с подтверждениями (SFP→BOS→FVG/OB), конфлюенсами (EMA/VWAP/POC),
-аргументированными SL/TP и подробными карточками сценариев. Источник данных — yfinance.
+SMC Intraday — BTC / ETH / XAUUSD / XAUEUR / EURUSD (text, SQLite journal)
+- Источник данных: Yahoo Finance (с фоллбэком интервалов)
+- Ядро подтверждений: sweep, BOS, imbalance(FVG), breaker, OB-retest
+- Вход всегда от mid-FVG (0.5)
+- Уведомления в Telegram при РОВНО 2 подтверждениях (антиспам в alerts)
+- Журнал сделок на SQLite + простая статистика
 """
 
 from __future__ import annotations
 
-import time
+import json
+import math
+import os
+import sqlite3
 from dataclasses import dataclass
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 import yfinance as yf
 
-
 # ==============================
-#        Конфигурация
+#          CONFIG
 # ==============================
 
 ASSETS = ["BTCUSDT", "ETHUSDT", "XAUUSD", "XAUEUR", "EURUSD"]
@@ -28,9 +35,9 @@ ASSETS = ["BTCUSDT", "ETHUSDT", "XAUUSD", "XAUEUR", "EURUSD"]
 YF_TICKER_CANDIDATES: Dict[str, List[str]] = {
     "BTCUSDT": ["BTC-USD"],
     "ETHUSDT": ["ETH-USD"],
-    "XAUUSD":  ["XAUUSD=X", "GC=F"],
-    "XAUEUR":  ["XAUEUR=X"],
-    "EURUSD":  ["EURUSD=X"],
+    "XAUUSD": ["XAUUSD=X", "GC=F"],
+    "XAUEUR": ["XAUEUR=X"],
+    "EURUSD": ["EURUSD=X"],
 }
 
 TF_FALLBACKS = {
@@ -38,12 +45,160 @@ TF_FALLBACKS = {
     "15m": [("15m", "60d"), ("60m", "730d")],
     "1h":  [("60m", "730d"), ("1d", "730d")],
 }
-
 HTF_OF = {"5m": "15m", "15m": "60m", "1h": "1d"}
 
+DB_PATH = "trades.sqlite"
+
+# ⚠️ По просьбе пользователя: токен прямо в коде.
+# Обязательно ПЕРЕВЫПУСТИТЕ токен после тестов.
+TELEGRAM_BOT_TOKEN = "6231361993:AAFCKT2rPnoJv2K4OXAZCpOq8KcjmFGvJjw"
 
 # ==============================
-#   Вспомогательные индикаторы
+#        DB helpers (SQLite)
+# ==============================
+
+def db_conn():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def db_init():
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS trades (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts_utc TEXT NOT NULL,
+      asset TEXT NOT NULL,
+      tf TEXT NOT NULL,
+      side TEXT NOT NULL,
+      entry REAL NOT NULL,
+      sl REAL NOT NULL,
+      tp1 REAL NOT NULL,
+      tp2 REAL,
+      rr REAL,
+      confirmations TEXT,        -- JSON list
+      confirm_count INTEGER,
+      context TEXT,               -- JSON: regime, biases, vp, atr, notes
+      scenario TEXT,              -- human explanation
+      status TEXT DEFAULT 'open', -- open/win/stop/be/closed
+      result_r REAL,              -- realized R if known
+      notes TEXT
+    );""")
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS alerts (
+      key TEXT PRIMARY KEY,       -- asset:tf:side
+      last_sent_utc TEXT,
+      last_price REAL,
+      confirms INTEGER
+    );""")
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS settings (
+      skey TEXT PRIMARY KEY,
+      sval TEXT
+    );""")
+    conn.commit()
+    conn.close()
+
+def settings_get(key: str) -> Optional[str]:
+    conn = db_conn(); cur = conn.cursor()
+    cur.execute("SELECT sval FROM settings WHERE skey=?", (key,))
+    r = cur.fetchone()
+    conn.close()
+    return r["sval"] if r else None
+
+def settings_set(key: str, value: str):
+    conn = db_conn(); cur = conn.cursor()
+    cur.execute("INSERT INTO settings(skey, sval) VALUES(?,?) ON CONFLICT(skey) DO UPDATE SET sval=excluded.sval", (key, value))
+    conn.commit(); conn.close()
+
+def journal_insert(asset: str, tf: str, side: str, entry: float, sl: float, tp1: float,
+                   tp2: Optional[float], rr: float, confirmations: List[str],
+                   context: Dict, scenario: str):
+    conn = db_conn(); cur = conn.cursor()
+    cur.execute("""INSERT INTO trades
+      (ts_utc, asset, tf, side, entry, sl, tp1, tp2, rr, confirmations, confirm_count, context, scenario)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+      (datetime.utcnow().isoformat(), asset, tf, side, entry, sl, tp1, tp2, rr,
+       json.dumps(confirmations, ensure_ascii=False), len(confirmations),
+       json.dumps(context, ensure_ascii=False), scenario))
+    conn.commit(); conn.close()
+
+def journal_read_df() -> pd.DataFrame:
+    conn = db_conn()
+    df = pd.read_sql_query("SELECT * FROM trades ORDER BY id DESC", conn)
+    conn.close()
+    return df
+
+def journal_update_row(row_id: int, status: str, result_r: Optional[float], notes: str):
+    conn = db_conn(); cur = conn.cursor()
+    cur.execute("UPDATE trades SET status=?, result_r=?, notes=? WHERE id=?",
+                (status, result_r if result_r is not None else None, notes, row_id))
+    conn.commit(); conn.close()
+
+def alert_should_send(asset: str, tf: str, side: str, price: float, confirms: int, cool_minutes=30) -> bool:
+    key = f"{asset}:{tf}:{side}"
+    conn = db_conn(); cur = conn.cursor()
+    cur.execute("SELECT * FROM alerts WHERE key=?", (key,))
+    r = cur.fetchone()
+    now = datetime.utcnow()
+    if not r:
+        cur.execute("INSERT INTO alerts(key, last_sent_utc, last_price, confirms) VALUES(?,?,?,?)",
+                    (key, now.isoformat(), price, confirms))
+        conn.commit(); conn.close()
+        return True
+    last = datetime.fromisoformat(r["last_sent_utc"])
+    ok = (now - last) > timedelta(minutes=cool_minutes)
+    if ok:
+        cur.execute("UPDATE alerts SET last_sent_utc=?, last_price=?, confirms=? WHERE key=?",
+                    (now.isoformat(), price, confirms, key))
+        conn.commit()
+    conn.close()
+    return ok
+
+# ==============================
+#   Telegram helpers
+# ==============================
+
+def tg_get_chat_id_from_updates(token: str) -> Optional[int]:
+    try:
+        r = requests.get(f"https://api.telegram.org/bot{token}/getUpdates", timeout=7)
+        if r.status_code == 200:
+            j = r.json()
+            if j.get("ok") and j.get("result"):
+                # берём последний апдейт
+                for upd in reversed(j["result"]):
+                    msg = upd.get("message") or upd.get("edited_message") or {}
+                    chat = msg.get("chat") or {}
+                    cid = chat.get("id")
+                    if cid: return int(cid)
+    except Exception:
+        pass
+    return None
+
+def tg_send_message(token: str, chat_id: int, text: str):
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, timeout=7)
+    except Exception:
+        pass
+
+def tg_ensure_chat_id() -> Optional[int]:
+    cid = settings_get("telegram_chat_id")
+    if cid:
+        try:
+            return int(cid)
+        except Exception:
+            pass
+    # Попытка авто-детекта (нужно написать боту /start)
+    cid = tg_get_chat_id_from_updates(TELEGRAM_BOT_TOKEN)
+    if cid:
+        settings_set("telegram_chat_id", str(cid))
+        return cid
+    return None
+
+# ==============================
+#   Utils & Indicators
 # ==============================
 
 def ema(x: pd.Series, n: int) -> pd.Series:
@@ -98,16 +253,26 @@ def vwap_series(df: pd.DataFrame) -> pd.Series:
     den = vol.cumsum().replace(0, np.nan)
     return (num / den).fillna(method="bfill").fillna(df["close"])
 
-def slope(series: pd.Series, last_n: int = 80) -> float:
-    n = min(len(series), last_n)
-    if n < 8: return 0.0
-    y = series.tail(n).values
-    x = np.arange(n, dtype=float)
-    return float(np.polyfit(x, y, 1)[0])
+def price_decimals(asset: str, price: float) -> int:
+    # приближённо, чтобы не было "1.16 везде"
+    if asset in ("EURUSD", "XAUEUR"):
+        return 5
+    if asset == "XAUUSD":
+        return 2
+    if price < 10:
+        return 5
+    if price < 100:
+        return 3
+    if price < 10000:
+        return 2
+    return 1
 
+def fmt_price(asset: str, x: float) -> str:
+    d = price_decimals(asset, x)
+    return f"{x:.{d}f}"
 
 # ==============================
-#         SMC элементы
+#   SMC primitives
 # ==============================
 
 def swings(df: pd.DataFrame, L=3, R=3):
@@ -142,11 +307,11 @@ def sweeps(df, SH, SL, win=180):
     for t in rec[SH.loc[rec.index]].index:
         level = df.loc[t, "high"]; post = rec[rec.index > t]
         if len(post[(post["high"] > level) & (post["close"] < level)]):
-            res["high"].append((t, level))
+            res["high"].append((t, float(level)))
     for t in rec[SL.loc[rec.index]].index:
         level = df.loc[t, "low"]; post = rec[rec.index > t]
         if len(post[(post["low"] < level) & (post["close"] > level)]):
-            res["low"].append((t, level))
+            res["low"].append((t, float(level)))
     return res
 
 def fvg(df, look=140):
@@ -155,9 +320,9 @@ def fvg(df, look=140):
     n = len(df); s = max(2, n - look)
     for i in range(s, n):
         if i - 2 >= 0 and lo[i] > hi[i - 2]:
-            out["bull"].append((idx[i], hi[i - 2], lo[i]))
+            out["bull"].append((idx[i], float(hi[i - 2]), float(lo[i])))
         if i - 2 >= 0 and hi[i] < lo[i - 2]:
-            out["bear"].append((idx[i], hi[i], lo[i - 2]))
+            out["bear"].append((idx[i], float(hi[i]), float(lo[i - 2])))
     return out
 
 def simple_ob(df, dir_, t, back=70):
@@ -183,14 +348,10 @@ def simple_ob(df, dir_, t, back=70):
 def volume_profile(df: pd.DataFrame, bins: int = 40) -> Dict[str, float | np.ndarray]:
     lo = float(df["low"].min()); hi = float(df["high"].max())
     if hi <= lo: hi = lo + 1e-6
-    edges = np.linspace(lo, hi, bins + 1)
-    prices = df["close"].values
-    vols = df["volume"].values.astype(float)
-    if np.nansum(vols) <= 1e-12:
-        vols = np.ones_like(vols, dtype=float)
-    vol = np.zeros(bins, dtype=float)
+    edges = np.linspace(lo, hi, bins + 1); vol = np.zeros(bins)
+    prices = df["close"].values; vols = df["volume"].values
     idx = np.clip(np.digitize(prices, edges) - 1, 0, bins - 1)
-    for i, v in zip(idx, vols): vol[i] += float(v)
+    for i, v in zip(idx, vols): vol[i] += v
     total = max(vol.sum(), 1.0)
     poc_i = int(vol.argmax()); poc = (edges[poc_i] + edges[poc_i + 1]) / 2
     area = [poc_i]; L = poc_i - 1; R = poc_i + 1; acc = vol[poc_i]
@@ -208,19 +369,8 @@ def last_swing_levels(df: pd.DataFrame, SH: pd.Series, SL: pd.Series) -> Tuple[O
     sl_lvl = float(df.loc[sl_idx[-1], "low"])  if len(sl_idx) else None
     return sh_lvl, sl_lvl
 
-def nearest_struct_target(df: pd.DataFrame, SH: pd.Series, SL: pd.Series,
-                          entry: float, direction: str) -> Optional[float]:
-    """Ближайшая цель по свингам в сторону входа."""
-    if direction == "long":
-        highs = [float(df.loc[i, "high"]) for i in SH[SH].index if float(df.loc[i, "high"]) > entry]
-        return min(highs) if highs else None
-    else:
-        lows = [float(df.loc[i, "low"]) for i in SL[SL].index if float(df.loc[i, "low"]) < entry]
-        return max(lows) if lows else None
-
-
 # ==============================
-#   Режимы/байасы/вероятности
+#    Bias & Regime
 # ==============================
 
 def score_bias(df: pd.DataFrame) -> str:
@@ -242,294 +392,120 @@ def market_regime(df: pd.DataFrame, vp: Dict[str, float | np.ndarray]) -> str:
     outside = (price > vp["vah"]) or (price < vp["val"])
     return "trend" if (ad >= 22 or outside) else "range"
 
-
 # ==============================
-#       Сценарии с подтверждениями
+#   Confirm Engine (3-of-N)
 # ==============================
 
 @dataclass
-class Scenario:
-    name: str
-    bias: str
-    etype: str
-    trigger: str
-    entry: float
-    sl: float
-    tp1: float
-    tp2: Optional[float]
-    rr: str
-    confirms: int
-    confirm_list: List[str]
-    explain_short: str
-    stop_reason: str
-    tp_reason: str
-    logic_path: List[str]
+class ConfirmPack:
+    side: str                # "long" / "short"
+    types: List[str]         # ["sweep","bos","imbalance",...]
+    extra: List[str]         # доп.факторы (EMA/VWAP/VP, etc.)
+    fvg_mid: Optional[float] # средина релевантного FVG для входа
+    fvg_edges: Optional[Tuple[float, float]]  # (low_edge, high_edge) для стопа
 
-def rr_targets(entry: float, sl: float, bias: str, min_rr: float = 2.0) -> Tuple[float, float, str]:
-    risk = abs(entry - sl) or 1e-9
+def confirm_engine(df: pd.DataFrame) -> List[ConfirmPack]:
+    packs: List[ConfirmPack] = []
+    price = float(df["close"].iloc[-1])
+    at = float(atr(df).iloc[-1]); at = max(at, 1e-6)
+    SH, SL = swings(df)
+    dir_bos, t_bos, _ = bos(df, SH, SL)
+    gaps = fvg(df)
+    swp = sweeps(df, SH, SL)
+
+    # imbalance near/active
+    bull_imb = list(reversed(gaps["bull"]))[:3]
+    bear_imb = list(reversed(gaps["bear"]))[:3]
+
+    # last relevant FVG (we need mid for entry)
+    def last_mid_and_edges(kind: str) -> Tuple[Optional[float], Optional[Tuple[float,float]]]:
+        arr = bull_imb if kind == "long" else bear_imb
+        if not arr: return None, None
+        _, a, b = arr[0]  # bull: (t, hi[i-2], lo[i]) mid of gap = (hi + lo)/2
+        lo, hi = (a, b) if kind == "long" else (b, a)
+        mid = (lo + hi) / 2.0
+        return mid, (lo, hi)
+
+    # LONG side confirmations
+    conf_long: List[str] = []
+    if swp["low"]: conf_long.append("sweep")
+    if dir_bos == "up": conf_long.append("bos")
+    if bull_imb: conf_long.append("imbalance")
+    # breaker: если был свип low и затем закрытие выше уровня свипа (упрощённо)
+    if swp["low"]:
+        _, lvl = swp["low"][-1]
+        if df["close"].iloc[-1] > lvl and dir_bos == "up":
+            conf_long.append("breaker")
+    # OB-retest упрощённо: после BOS up есть demand-OB и цена рядом
+    ob = simple_ob(df, dir_bos, t_bos)
+    if ob.get("demand"):
+        _, lo, hi = ob["demand"]
+        if abs(price - hi) <= 0.6 * at:
+            conf_long.append("ob_retest")
+
+    mid_long, edges_long = last_mid_and_edges("long")
+
+    # SHORT side confirmations
+    conf_short: List[str] = []
+    if swp["high"]: conf_short.append("sweep")
+    if dir_bos == "down": conf_short.append("bos")
+    if bear_imb: conf_short.append("imbalance")
+    if swp["high"]:
+        _, lvl = swp["high"][-1]
+        if df["close"].iloc[-1] < lvl and dir_bos == "down":
+            conf_short.append("breaker")
+    if ob.get("supply"):
+        _, lo, hi = ob["supply"]
+        if abs(price - lo) <= 0.6 * at:
+            conf_short.append("ob_retest")
+
+    mid_short, edges_short = last_mid_and_edges("short")
+
+    # Доп. контекст (не считаются как подтверждения ядра)
+    extra: List[str] = []
+    vw = float(vwap_series(df).iloc[-1])
+    e20 = float(ema(df["close"], 20).iloc[-1])
+    if price > vw: extra.append("above VWAP")
+    else: extra.append("below VWAP")
+    if price > e20: extra.append("above EMA20")
+    else: extra.append("below EMA20")
+
+    packs.append(ConfirmPack("long", conf_long, extra, mid_long, edges_long))
+    packs.append(ConfirmPack("short", conf_short, extra, mid_short, edges_short))
+    return packs
+
+def confirm_rule_ok(types: List[str]) -> Tuple[bool, int]:
+    """
+    Требование пользователя:
+    - нужно 3 подтверждения
+    - лучше разного типа (sweep+bos+imb), НО допустимо sweep+imb+imb
+    """
+    n = len(types)
+    if n < 3:
+        return False, n
+    uniq = set(types)
+    if len(uniq) >= 3:
+        return True, n
+    # иначе разрешим кейс с двойным IMB
+    if types.count("imbalance") >= 2 and "sweep" in types:
+        return True, n
+    return False, n
+
+# ==============================
+#   RR / Targets
+# ==============================
+
+def rr_targets(entry: float, sl: float, bias: str, min_rr: float = 2.0) -> Tuple[float, float, float]:
+    risk = abs(entry - sl) or 1e-6
     if bias == "long":
         tp1 = entry + min_rr * risk; tp2 = entry + 3.0 * risk
     else:
         tp1 = entry - min_rr * risk; tp2 = entry - 3.0 * risk
-    return tp1, tp2, f"1:{int(min_rr)}/1:3"
-
-def scenario_ev(entry, sl, tp1, prob):
-    risk = abs(entry - sl); reward = abs(tp1 - entry)
-    fees = 0.0002 * (risk + reward)
-    return prob * reward - (1 - prob) * risk - fees
-
-def fmt_reason_list(items: List[str]) -> str:
-    return ", ".join(items) if items else "—"
-
-def propose(df: pd.DataFrame, htf_bias: str, d_bias: str, regime: str,
-            vp: Dict[str, float | np.ndarray], obv_slope_val: float) -> List[Scenario]:
-    c = float(df["close"].iloc[-1])
-    at = float(atr(df).iloc[-1]); at = max(at, 1e-9)
-    SH, SL = swings(df); dir_bos, t_bos, lvl_bos = bos(df, SH, SL)
-    gaps = fvg(df); swp = sweeps(df, SH, SL); ob = simple_ob(df, dir_bos, t_bos)
-    sh_lvl, sl_lvl = last_swing_levels(df, SH, SL)
-    vw = float(vwap_series(df).iloc[-1]); ema20_val = float(ema(df["close"], 20).iloc[-1])
-    ema_up = slope(ema(df["close"], 20)) > 0
-    ema_dn = slope(ema(df["close"], 20)) < 0
-    above_poc = c > vp["poc"]
-
-    def generic_confs(bias: str, entry: float) -> List[str]:
-        out = []
-        if (bias == "long" and obv_slope_val > 0) or (bias == "short" and obv_slope_val < 0):
-            out.append("OBV подтверждает")
-        if (bias == "long" and ema_up) or (bias == "short" and ema_dn):
-            out.append("тренд EMA20")
-        if (bias == "long" and above_poc) or (bias == "short" and not above_poc):
-            out.append("сторона POC")
-        if abs(entry - vw) <= 0.6 * at:
-            out.append("рядом VWAP")
-        if (bias == htf_bias) or (bias == d_bias):
-            out.append("HTF/Daily согласование")
-        return out
-
-    def structural_tp(entry: float, bias: str) -> Tuple[float, str]:
-        tgt = nearest_struct_target(df, SH, SL, entry, "long" if bias == "long" else "short")
-        if tgt is not None:
-            return tgt, "ближайший свинг по направлению"
-        # запасные варианты — POC/VAH/VAL
-        if bias == "long":
-            if entry < vp["poc"] <= vp["vah"]: return vp["poc"], "POC"
-            return entry + 2.0 * abs(entry - (entry - 1.0 * at)), "≈2R (структурной цели рядом нет)"
-        else:
-            if entry > vp["poc"] >= vp["val"]: return vp["poc"], "POC"
-            return entry - 2.0 * abs(entry - (entry + 1.0 * at)), "≈2R (структурной цели рядом нет)"
-
-    scenarios: List[Scenario] = []
-
-    def add(name: str, bias: str, etype: str, trigger: str,
-            entry: float, sl: float, base_confirms: List[str],
-            stop_reason: str, tp_hint: Optional[str],
-            logic_path: List[str], fvg_touch: bool = False, ob_touch: bool = False):
-        confs = base_confirms[:]
-        confs += generic_confs(bias, entry)
-        if fvg_touch: confs.append("FVG конfluence")
-        if ob_touch: confs.append("OB ретест")
-        confirms = len(confs)
-
-        # цели — сначала структурная, затем R-бекапы
-        tp1_struct, tp1_reason = structural_tp(entry, bias)
-        if bias == "long":
-            tp1 = min(tp1_struct, entry + 3.0 * abs(entry - sl))
-        else:
-            tp1 = max(tp1_struct, entry - 3.0 * abs(entry - sl))
-        # TP2 — более дальний ориентир: VAH/VAL либо 3R
-        if bias == "long":
-            tp2 = max(tp1, vp["vah"]) if vp["vah"] > entry else entry + 3.0 * abs(entry - sl)
-        else:
-            tp2 = min(tp1, vp["val"]) if vp["val"] < entry else entry - 3.0 * abs(entry - sl)
-
-        rr = f"1:2/1:3"
-        scenarios.append(
-            Scenario(
-                name=name, bias=bias, etype=etype, trigger=trigger,
-                entry=float(entry), sl=float(sl), tp1=float(tp1), tp2=float(tp2),
-                rr=rr, confirms=confirms, confirm_list=confs,
-                explain_short=f"{name}: " + (" → ".join(logic_path)),
-                stop_reason=stop_reason,
-                tp_reason=tp1_reason if tp_hint is None else tp_hint,
-                logic_path=logic_path
-            )
-        )
-
-    # ===== 1) SFP → BOS → FVG (самый «надёжный» паттерн) =====
-    if swp["high"] and dir_bos == "down" and gaps["bear"]:
-        t_sfp, lvl_sfp = swp["high"][-1]
-        _, lo, hi = list(reversed(gaps["bear"]))[0]
-        mid = (lo + hi) / 2
-        e = mid - 0.05 * at
-        sl = lvl_sfp + 0.7 * at
-        add(
-            name="SFP→BOS→FVG", bias="short", etype="limit",
-            trigger=f"касание mid FVG {mid:.5f}", entry=e, sl=sl,
-            base_confirms=["SFP high", "BOS↓"],
-            stop_reason="за SFP-уровень +0.7×ATR",
-            tp_hint="первая цель — ближайший свинг/POC",
-            logic_path=["срыв high", "пробой вниз", "имбаланс вниз"],
-            fvg_touch=True
-        )
-    if swp["low"] and dir_bos == "up" and gaps["bull"]:
-        t_sfp, lvl_sfp = swp["low"][-1]
-        _, lo, hi = list(reversed(gaps["bull"]))[0]
-        mid = (lo + hi) / 2
-        e = mid + 0.05 * at
-        sl = lvl_sfp - 0.7 * at
-        add(
-            name="SFP→BOS→FVG", bias="long", etype="limit",
-            trigger=f"касание mid FVG {mid:.5f}", entry=e, sl=sl,
-            base_confirms=["SFP low", "BOS↑"],
-            stop_reason="за SFP-уровень −0.7×ATR",
-            tp_hint="первая цель — ближайший свинг/POC",
-            logic_path=["срыв low", "пробой вверх", "имбаланс вверх"],
-            fvg_touch=True
-        )
-
-    # ===== 2) BOS → OB-ретест (+FVG) =====
-    if dir_bos == "up" and ob.get("demand"):
-        _, lo, hi = ob["demand"]
-        e = hi; sl = lo - 0.6 * at
-        add(
-            name="BOS→OB Retest", bias="long", etype="limit",
-            trigger=f"retest OB {lo:.5f}-{hi:.5f}", entry=e, sl=sl,
-            base_confirms=["BOS↑"], stop_reason="за противоположную грань OB −0.6×ATR",
-            tp_hint=None, logic_path=["пробой вверх", "ретест спроса"],
-            ob_touch=True, fvg_touch=bool(gaps["bull"])
-        )
-    if dir_bos == "down" and ob.get("supply"):
-        _, lo, hi = ob["supply"]
-        e = lo; sl = hi + 0.6 * at
-        add(
-            name="BOS→OB Retest", bias="short", etype="limit",
-            trigger=f"retest OB {lo:.5f}-{hi:.5f}", entry=e, sl=sl,
-            base_confirms=["BOS↓"], stop_reason="за противоположную грань OB +0.6×ATR",
-            tp_hint=None, logic_path=["пробой вниз", "ретест предложения"],
-            ob_touch=True, fvg_touch=bool(gaps["bear"])
-        )
-
-    # ===== 3) Breaker после свипа =====
-    if swp["high"] and dir_bos == "down":
-        _, lvl = swp["high"][-1]
-        e = lvl - 0.1 * at; sl = lvl + 0.7 * at
-        add("Breaker", "short", "stop", f"возврат под {lvl:.5f}", e, sl,
-            base_confirms=["SFP high", "BOS↓"], stop_reason="над свип-уровнем +0.7×ATR",
-            tp_hint="TP1 у ближайшего low/POC", logic_path=["срыв high", "возврат/пробой вниз"])
-    if swp["low"] and dir_bos == "up":
-        _, lvl = swp["low"][-1]
-        e = lvl + 0.1 * at; sl = lvl - 0.7 * at
-        add("Breaker", "long", "stop", f"возврат над {lvl:.5f}", e, sl,
-            base_confirms=["SFP low", "BOS↑"], stop_reason="под свип-уровнем −0.7×ATR",
-            tp_hint="TP1 у ближайшего high/POC", logic_path=["срыв low", "возврат/пробой вверх"])
-
-    # ===== 4) Range Reversion (VAL/VAH) с SFP у края =====
-    adx_val = float(adx(df).iloc[-1])
-    if regime == "range" and adx_val < 22:
-        near_val = abs(c - vp["val"]) <= max(0.6 * at, 0.1 * (vp["vah"] - vp["val"]))
-        near_vah = abs(c - vp["vah"]) <= max(0.6 * at, 0.1 * (vp["vah"] - vp["val"]))
-        if near_val:
-            e = vp["val"] + 0.1 * at; sl = vp["val"] - 0.8 * at
-            confs = ["VAL edge", "ADX низкий"]
-            if swp["low"]: confs.append("SFP low у края")
-            add("Value Area Reversion", "long", "limit", "от VAL к POC", e, sl,
-                base_confirms=confs, stop_reason="за VAL −0.8×ATR",
-                tp_hint="TP1 — POC", logic_path=["боковик", "край VAL", "отбой"])
-        if near_vah:
-            e = vp["vah"] - 0.1 * at; sl = vp["vah"] + 0.8 * at
-            confs = ["VAH edge", "ADX низкий"]
-            if swp["high"]: confs.append("SFP high у края")
-            add("Value Area Reversion", "short", "limit", "от VAH к POC", e, sl,
-                base_confirms=confs, stop_reason="за VAH +0.8×ATR",
-                tp_hint="TP1 — POC", logic_path=["боковик", "край VAH", "отбой"])
-
-    # ===== 5) EMA Pullback в тренде (с VWAP/POC конfluence) =====
-    if regime == "trend" and c > ema20_val:
-        e = ema20_val; sl = e - 1.2 * at
-        add("EMA Pullback", "long", "limit", f"к EMA20 {e:.5f}", e, sl,
-            base_confirms=["тренд вверх", "EMA20"], stop_reason="ниже EMA20 −1.2×ATR",
-            tp_hint=None, logic_path=["тренд", "pullback к EMA/VWAP"], fvg_touch=bool(gaps["bull"]))
-    if regime == "trend" and c < ema20_val:
-        e = ema20_val; sl = e + 1.2 * at
-        add("EMA Pullback", "short", "limit", f"к EMA20 {e:.5f}", e, sl,
-            base_confirms=["тренд вниз", "EMA20"], stop_reason="выше EMA20 +1.2×ATR",
-            tp_hint=None, logic_path=["тренд", "pullback к EMA/VWAP"], fvg_touch=bool(gaps["bear"]))
-
-    # ===== 6) Структурный пробой + ретест =====
-    if sh_lvl is not None:
-        base_sl = (sl_lvl if sl_lvl is not None else c - 1.2 * at)
-        e = sh_lvl + 0.2 * at; sl = base_sl - 0.4 * at
-        add("Structure Breakout", "long", "stop", f"пробой {sh_lvl:.5f}", e, sl,
-            base_confirms=["уровень swing↑", "ретест"], stop_reason="за ближайший swing −0.4×ATR",
-            tp_hint=None, logic_path=["breakout", "ret"])
-    if sl_lvl is not None:
-        base_sl = (sh_lvl if sh_lvl is not None else c + 1.2 * at)
-        e = sl_lvl - 0.2 * at; sl = base_sl + 0.4 * at
-        add("Structure Breakout", "short", "stop", f"пробой {sl_lvl:.5f}", e, sl,
-            base_confirms=["уровень swing↓", "ретест"], stop_reason="за ближайший swing +0.4×ATR",
-            tp_hint=None, logic_path=["breakdown", "ret"])
-
-    # сортировка: сначала по числу подтверждений, затем по контексту
-    def _sort_key(x: Scenario):
-        score = -x.confirms
-        if (x.name.startswith(("SFP→BOS→FVG", "BOS→OB", "EMA", "Structure")) and regime == "trend") or \
-           (x.name.startswith(("Value Area", "Breaker")) and regime == "range"):
-            score -= 1
-        if x.bias == htf_bias: score -= 0.5
-        return score
-
-    uniq, seen = [], set()
-    for s in sorted(scenarios, key=_sort_key):
-        k = (s.name, s.bias)
-        if k in seen: continue
-        seen.add(k); uniq.append(s)
-        if len(uniq) >= 8: break
-
-    if not uniq:
-        c0 = c
-        uniq.append(Scenario("Wait (no-trade)", "none", "—", "нет валидных сетапов",
-                             c0, c0, c0, c0, "—", 0, [], "Пауза.", "—", "—", []))
-    return uniq
-
+    rr = round(abs(tp1 - entry) / risk, 2)
+    return tp1, tp2, rr
 
 # ==============================
-#       Вероятности идей
-# ==============================
-
-def scenario_probabilities(
-    scen: List[Scenario], htf_bias: str, d_bias: str, obv_slope_val: float,
-    price: float, vp: Dict[str, float | np.ndarray], atr_val: float, regime: str,
-    *, cap: float = 0.90, floor: float = 0.05, temp: float = 1.15
-) -> Tuple[Dict[str, float], Dict[str, float]]:
-    if not scen: return {"Wait (no-trade)": 100.0}, {"long": 0.0, "short": 0.0}
-    scores, labels = [], []
-    for s in scen:
-        if s.name.startswith("Wait"): continue
-        sc = 0.6 * s.confirms  # весим подтверждения сильнее
-        if s.bias == htf_bias: sc += 1.8
-        if s.bias == d_bias:  sc += 1.0
-        sc += 0.8 if (obv_slope_val > 0 and s.bias == "long") or (obv_slope_val < 0 and s.bias == "short") else -0.2
-        if (s.name.startswith(("SFP→BOS→FVG","BOS→OB","EMA","Structure")) and regime == "trend") or \
-           (s.name.startswith(("Value Area","Breaker")) and regime == "range"): sc += 1.0
-        dist = abs(s.entry - price) / max(atr_val, 1e-6)
-        if dist > 2.0: sc -= 1.0
-        elif dist > 1.5: sc -= 0.5
-        scores.append(sc); labels.append((s.name, s.bias))
-    if not scores: return {"Wait (no-trade)": 100.0}, {"long": 0.0, "short": 0.0}
-    scores = np.array(scores, dtype=float) / temp
-    ex = np.exp(scores - scores.max()); probs = ex / ex.sum()
-    probs = np.clip(probs, floor, cap); probs = probs / probs.sum()
-    out, agg = {}, {"long": 0.0, "short": 0.0}
-    for (lbl, bias), p in zip(labels, probs):
-        val = float(np.round(p * 100.0, 2))
-        out[f"{lbl} ({bias})"] = val; agg[bias] += val
-    out = dict(sorted(out.items(), key=lambda x: x[1], reverse=True))
-    return out, {k: round(v, 2) for k, v in agg.items()}
-
-
-# ==============================
-#       Данные (yfinance)
+#   Data via yfinance (fallback)
 # ==============================
 
 @st.cache_data(show_spinner=False, ttl=60)
@@ -540,8 +516,7 @@ def yf_ohlc_first_success(asset_key: str, tf: str, limit: int = 800) -> Tuple[pd
     for tkr in cands:
         for interval, period in tries:
             try:
-                df = yf.download(tkr, interval=interval, period=period,
-                                 auto_adjust=False, progress=False)
+                df = yf.download(tkr, interval=interval, period=period, auto_adjust=False, progress=False)
                 if df.empty:
                     last_err = f"{tkr}@{interval}/{period}: пусто"; continue
                 if isinstance(df.columns, pd.MultiIndex):
@@ -549,8 +524,7 @@ def yf_ohlc_first_success(asset_key: str, tf: str, limit: int = 800) -> Tuple[pd
                 df = df.rename(columns={"Open":"open","High":"high","Low":"low","Close":"close","Adj Close":"adj_close","Volume":"volume"})
                 need = ["open","high","low","close","volume"]
                 for c in need:
-                    if c not in df.columns:
-                        df[c] = 0.0 if c == "volume" else np.nan
+                    if c not in df.columns: df[c] = 0.0 if c == "volume" else np.nan
                     df[c] = pd.to_numeric(df[c], errors="coerce")
                 try:
                     if df.index.tz is None: df.index = pd.to_datetime(df.index, utc=True)
@@ -566,29 +540,6 @@ def yf_ohlc_first_success(asset_key: str, tf: str, limit: int = 800) -> Tuple[pd
                 continue
     raise RuntimeError(f"yfinance: не удалось получить данные для {asset_key}. Последняя ошибка: {last_err}")
 
-
-# ==============================
-#          Вспомогалка UI
-# ==============================
-
-def infer_decimals(df: pd.DataFrame, asset: str) -> int:
-    x = df["close"].tail(300).diff().abs()
-    step = float(np.nanmin(x[x > 0])) if np.any(x > 0) else 0.0
-    if step > 0:
-        p = max(2, min(6, int(np.ceil(-np.log10(step)) + 1)))
-    else:
-        default = {"EURUSD": 5, "XAUEUR": 5, "XAUUSD": 2, "BTCUSDT": 2, "ETHUSDT": 2}
-        p = default.get(asset, 4)
-    return p
-
-def fmt_price(x: float, decimals: int) -> str:
-    s = f"{x:.{decimals}f}"
-    if "." in s:
-        a, b = s.split("."); a = f"{int(float(a)):,}".replace(",", " ")
-        return f"{a}.{b}"
-    return f"{int(float(s)):,}".replace(",", " ")
-
-
 # ==============================
 #             UI
 # ==============================
@@ -596,158 +547,203 @@ def fmt_price(x: float, decimals: int) -> str:
 st.set_page_config(page_title="SMC Intraday (text)", layout="wide")
 st.title("SMC Intraday — BTC / ETH / XAUUSD / XAUEUR / EURUSD (text)")
 
-colA, colB, colC, colD, colE = st.columns([1.2, 1, 1, 1, 1])
-with colA:
-    asset = st.selectbox("Актив", ASSETS, index=4 if "EURUSD" in ASSETS else 0)
-with colB:
-    tf = st.selectbox("TF", ["5m", "15m", "1h"], index=0)
-with colC:
-    min_risk_pct = st.slider("Мин. риск (%ATR)", 5, 60, 25, step=5)
-with colD:
-    min_tp1_atr = st.slider("Мин. TP1 (×ATR)", 1.0, 3.0, 1.5, step=0.25)
-with colE:
-    min_confirms = st.slider("Мин. подтверждений", 2, 7, 4, step=1)
+db_init()
 
-colF, colG = st.columns([1, 1])
-with colF:
-    refresh_mode = st.selectbox("Обновление", ["Выключено", "Каждые 30s", "1m", "2m", "5m"], index=0)
-with colG:
-    if st.button("🔄 Обновить сейчас"):
-        st.cache_data.clear(); st.toast("Данные обновлены"); st.experimental_rerun()
+tab_an, tab_jrnl, tab_cfg = st.tabs(["Анализ", "Журнал", "Настройки"])
 
-INTERVALS = {"Каждые 30s": 30, "1m": 60, "2m": 120, "5m": 300}
-if "next_refresh_ts" not in st.session_state:
-    st.session_state.next_refresh_ts = time.time() + 10**9
-if refresh_mode != "Выключено":
-    interval = INTERVALS[refresh_mode]; now = time.time()
-    if now >= st.session_state.next_refresh_ts:
-        st.session_state.next_refresh_ts = now + interval
-        st.cache_data.clear(); st.experimental_rerun()
-else:
-    st.session_state.next_refresh_ts = time.time() + 10**9
+with tab_cfg:
+    st.subheader("Telegram")
+    cid = settings_get("telegram_chat_id")
+    st.write("Chat ID:", cid if cid else "пока не определён")
+    if st.button("Попробовать autodetect chat_id через getUpdates"):
+        cid_new = tg_ensure_chat_id()
+        if cid_new: st.success(f"Нашёл chat_id: {cid_new}")
+        else: st.warning("Не удалось. Напишите боту /start и попробуйте снова.")
+    st.caption("Уведомление отправляется при РОВНО 2 подтверждениях (антиспам: не чаще раза в 30 минут для одной стороны).")
 
-beginner_mode = st.checkbox("Простой режим (для новичка)", value=True)
+with tab_an:
+    colA, colB, colC, colD = st.columns([1.2, 1, 1, 1])
+    with colA:
+        asset = st.selectbox("Актив", ASSETS, index=0)
+    with colB:
+        tf = st.selectbox("TF", ["5m", "15m", "1h"], index=0)
+    with colC:
+        min_risk_pct = st.slider("Мин. риск (%ATR)", 5, 60, 25, step=5)
+    with colD:
+        min_tp1_atr = st.slider("Мин. TP1 (×ATR)", 1.0, 3.0, 1.5, step=0.25)
 
-with st.expander("📘 Справочник"):
-    st.markdown(
-        "- **Иерархия подтверждений:**\n"
-        "  - SFP/срыв → BOS → FVG или OB-ретест — базовый корпус (2–3 подтверждения).\n"
-        "  - Конфлюенсы: тренд EMA20, сторона к POC, близость VWAP, OBV в сторону, HTF/Daily в сторону.\n"
-        "  - В боковике добавляется край VAL/VAH и низкий ADX.\n"
-        "- **Стопы** ставятся за структурный уровень + ATR-буфер (0.4–1.2×ATR в зависимости от сетапа).\n"
-        "- **TP1** — ближайший свинг/POC/VAL/VAH (если рядом) либо ≈2R; **TP2** — дальняя цель (VAH/VAL или ≈3R)."
-    )
+    colE, colF = st.columns([1, 1])
+    with colE:
+        it = st.selectbox("Auto-refresh", ["Выкл", "30s", "1m", "2m", "5m"], index=0)
+    with colF:
+        beginner_mode = st.checkbox("Простой режим (для новичка)", value=True)
 
-st.caption(
-    "Идеи с риском ниже порога %ATR и с TP1 меньше заданного множителя ATR скрываются. "
-    "TP1=~2R (или структурная цель), TP2≈3R. Вероятности — относительные."
-)
+    if it != "Выкл":
+        st.markdown(f"<meta http-equiv='refresh' content='{ {'30s':30,'1m':60,'2m':120,'5m':300}[it] }'>",
+                    unsafe_allow_html=True)
 
+    st.caption("Входы строятся строго от середины последнего актуального FVG по направлению подтверждений. Отображаются только сетапы с ≥3 подтверждениями ядра.")
 
-# ==============================
-#        Основной поток
-# ==============================
+    try:
+        # Data
+        df, tf_eff, _ = yf_ohlc_first_success(asset, tf, limit=800)
+        df_h, _, _ = yf_ohlc_first_success(asset, HTF_OF[tf], limit=400)
+        df_d, _, _ = yf_ohlc_first_success(asset, "1h", limit=24 * 200)  # дневку суррогируем из 1h
 
-summary: List[str] = []
+        price = float(df["close"].iloc[-1])
+        decs = price_decimals(asset, price)
+        vp = volume_profile(df)
+        reg = market_regime(df, vp)
+        atr_v = float(atr(df).iloc[-1])
 
-try:
-    df, tf_eff, _ = yf_ohlc_first_success(asset, tf, limit=800)
-    htf = HTF_OF[tf]; df_h, _, _ = yf_ohlc_first_success(asset, htf, limit=400)
-    df_d, _, _ = yf_ohlc_first_success(asset, "1d", limit=600)
+        ltf_b = score_bias(df); htf_b = score_bias(df_h); d_b = regime_daily(df_d)
 
-    price = float(df["close"].iloc[-1])
-    vp = volume_profile(df); reg = market_regime(df, vp)
-    atr_v = float(atr(df).iloc[-1]); obv_s = slope(obv(df), 160)
+        st.markdown(
+            f"**{asset} ({tf}) — цена:** {fmt_price(asset, price)}  \n"
+            f"**Контекст:** LTF={ltf_b.upper()}, HTF={htf_b.upper()}, Daily={d_b.upper()} • "
+            f"Режим: {reg.upper()} (ADX≈{float(adx(df).iloc[-1]):.1f}) • "
+            f"VP: POC {fmt_price(asset, vp['poc'])}, VAL {fmt_price(asset, vp['val'])}, VAH {fmt_price(asset, vp['vah'])}"
+        )
 
-    htf_bias = score_bias(df_h); d_bias = regime_daily(df_d)
-    scenarios_all = propose(df, htf_bias, d_bias, reg, vp, obv_s)
+        # Confirm engine
+        packs = confirm_engine(df)
 
-    # фильтры
-    min_risk = atr_v * (min_risk_pct / 100.0)
-    scenarios: List[Scenario] = []
-    for sc in scenarios_all:
-        if sc.name.startswith("Wait"): continue
-        if sc.confirms < min_confirms: continue
-        risk_ok = abs(sc.entry - sc.sl) >= min_risk
-        tp1_ok = (abs(sc.tp1 - sc.entry) / max(atr_v, 1e-6)) >= min_tp1_atr
-        if risk_ok and tp1_ok:
-            scenarios.append(sc)
-    if not scenarios:
-        scenarios = [s for s in scenarios_all if not s.name.startswith("Wait")] or scenarios_all
+        rows = []
+        made_any = False
 
-    sc_probs, bias_summary = scenario_probabilities(scenarios, htf_bias, d_bias, obv_s, price, vp, atr_v, reg)
+        for pk in packs:
+            # Telegram alert if exactly 2 confirmations
+            if len(pk.types) == 2:
+                if alert_should_send(asset, tf, pk.side, price, 2):
+                    cid = tg_ensure_chat_id()
+                    if cid:
+                        text = (f"⚠️ {asset} {tf} — {pk.side.upper()}\n"
+                                f"Подтв.: {', '.join(pk.types)} (2/3)\n"
+                                f"Цена: {fmt_price(asset, price)}")
+                        tg_send_message(TELEGRAM_BOT_TOKEN, cid, text)
 
-    decimals = infer_decimals(df, asset)
-    st.markdown(f"## {asset} ({tf}) — цена: {fmt_price(price, decimals)}")
+            ok, nconf = confirm_rule_ok(pk.types)
+            if not ok:  # меньше 3 (или неподходящая комбинация) — пропускаем
+                continue
 
-    ltf_b = score_bias(df); htf_b = score_bias(df_h); d_b = regime_daily(df_d)
-    poc_state = "выше VAH" if price > vp["vah"] else ("ниже VAL" if price < vp["val"] else "внутри value area")
-    st.markdown(
-        f"**Контекст:** LTF={ltf_b.upper()}, HTF={htf_b.upper()}, Daily={d_b.upper()} • "
-        f"Режим: {reg.upper()} (ADX≈{float(adx(df).iloc[-1]):.1f}) • "
-        f"POC {fmt_price(vp['poc'], decimals)}, VAL {fmt_price(vp['val'], decimals)}, VAH {fmt_price(vp['vah'], decimals)} → цена {poc_state}.  \n"
-        f"**Баланс:** LONG {bias_summary['long']:.1f}% vs SHORT {bias_summary['short']:.1f}%"
-    )
+            # Только вход от mid-FVG. Если FVG нет — пропускаем.
+            if pk.fvg_mid is None or pk.fvg_edges is None:
+                continue
 
-    # главная карточка
-    if scenarios:
-        top_key = list(sc_probs.keys())[0] if sc_probs else f"{scenarios[0].name} ({scenarios[0].bias})"
-        main_sc = next((s for s in scenarios if f"{s.name} ({s.bias})" == top_key), scenarios[0])
-        if beginner_mode:
-            rr_to_tp1 = round(abs(main_sc.tp1 - main_sc.entry) / max(abs(main_sc.entry - main_sc.sl), 1e-9), 2)
-            st.markdown(f"### Что сделать сейчас — {'ПОКУПКА (LONG)' if main_sc.bias=='long' else 'ПРОДАЖА (SHORT)'}")
-            st.markdown(
-                f"- **Почему:** {main_sc.explain_short}  \n"
-                f"- **Подтверждений:** {main_sc.confirms} — {', '.join(main_sc.confirm_list)}  \n"
-                f"- **Вход:** {fmt_price(main_sc.entry, decimals)}  \n"
-                f"- **Стоп:** {fmt_price(main_sc.sl, decimals)} ({main_sc.stop_reason}; "
-                f"риск ≈ {fmt_price(abs(main_sc.entry-main_sc.sl), decimals)}, ATR≈{fmt_price(atr_v, decimals)})  \n"
-                f"- **Цели:** TP1 {fmt_price(main_sc.tp1, decimals)} ({main_sc.tp_reason}); "
-                + (f"TP2 {fmt_price(main_sc.tp2, decimals)}" if main_sc.tp2 else "без TP2")
-                + f" • **R:R≈{rr_to_tp1}**"
-            )
+            entry = pk.fvg_mid
+            # стоп за дальний край FVG с небольшим буфером
+            lo, hi = pk.fvg_edges
+            if pk.side == "long":
+                sl = min(lo, hi) - 0.2 * atr_v
+            else:
+                sl = max(lo, hi) + 0.2 * atr_v
+
+            tp1, tp2, rr_val = rr_targets(entry, sl, pk.side, min_rr=2.0)
+
+            # фильтры
+            risk_ok = abs(entry - sl) >= atr_v * (min_risk_pct / 100.0)
+            tp1_ok = (abs(tp1 - entry) / max(atr_v, 1e-6)) >= min_tp1_atr
+            if not (risk_ok and tp1_ok):
+                continue
+
+            made_any = True
+
+            # Доп. описание
+            expl = []
+            expl.append(f"Вход по mid-FVG (0.5). Подтверждения ядра: {', '.join(pk.types)}.")
+            expl.append(f"Стоп за дальний край FVG ±0.2×ATR. Доп. контекст: {', '.join(pk.extra)}.")
+            scenario_text = " ".join(expl)
+
+            # Карточка новичка
+            if beginner_mode:
+                st.markdown(f"### Что сделать сейчас — {'ПОКУПКА (LONG)' if pk.side=='long' else 'ПРОДАЖА (SHORT)'}")
+                st.markdown(
+                    "- **Почему:** " + scenario_text + "\n"
+                    f"- **Вход:** {fmt_price(asset, entry)}  \n"
+                    f"- **Стоп:** {fmt_price(asset, sl)} (риск≈{fmt_price(asset, abs(entry-sl))}, ATR≈{fmt_price(asset, atr_v)})  \n"
+                    f"- **Цели:** TP1 {fmt_price(asset, tp1)} (R:R≈{rr_val}), TP2 {fmt_price(asset, tp2)}  \n"
+                    f"- **Подтв.:** {', '.join(pk.types)} (всего {len(pk.types)})"
+                )
+
+            # строка в таблицу
+            rows.append({
+                "Сторона": pk.side,
+                "Подтв. (ядро)": ", ".join(pk.types),
+                "Вход": fmt_price(asset, entry),
+                "Стоп": fmt_price(asset, sl),
+                "TP1": fmt_price(asset, tp1),
+                "TP2": fmt_price(asset, tp2),
+                "R:R до TP1": rr_val,
+                "Доп. факторы": ", ".join(pk.extra),
+            })
+
+            # кнопка в журнал
+            with st.container():
+                c1, c2, c3 = st.columns([1, 1, 6])
+                with c1:
+                    if st.button(f"Добавить в журнал ({pk.side})", key=f"add_{pk.side}_{len(rows)}"):
+                        context = {
+                            "regime": reg, "atr": atr_v,
+                            "bias_ltf": ltf_b, "bias_htf": htf_b, "bias_d": d_b,
+                            "poc": vp["poc"], "val": vp["val"], "vah": vp["vah"]
+                        }
+                        journal_insert(asset, tf, pk.side, float(entry), float(sl), float(tp1), float(tp2),
+                                       float(rr_val), pk.types, context, scenario_text)
+                        st.success("Сделка добавлена в журнал.")
+                with c2:
+                    st.write("")
+
+        if rows:
+            st.markdown("### Все валидные варианты")
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        if not made_any:
+            st.info("Сейчас нет валидных (3-подтв.) входов от mid-FVG. Подождите формирования условий.")
+
+    except Exception as e:
+        st.error(f"{asset}: {e}")
+
+with tab_jrnl:
+    st.subheader("Журнал сделок (SQLite)")
+    dfj = journal_read_df()
+    if dfj.empty:
+        st.info("Пока пусто. Добавляйте сделки из вкладки «Анализ».")
     else:
-        st.info("Нет понятного входа: подождать свипа/ретеста ключевых уровней.")
+        # редактирование строк
+        for _, row in dfj.iterrows():
+            with st.expander(f"#{int(row['id'])} • {row['ts_utc']} • {row['asset']} {row['tf']} • {row['side'].upper()} • entry {fmt_price(row['asset'], row['entry'])}"):
+                st.write(f"SL {fmt_price(row['asset'], row['sl'])} • TP1 {fmt_price(row['asset'], row['tp1'])} • TP2 {fmt_price(row['asset'], row['tp2']) if not pd.isna(row['tp2']) else '—'} • RR≈{row['rr']}")
+                st.write("Подтв.:", ", ".join(json.loads(row["confirmations"])) if row["confirmations"] else "—")
+                st.write("Сценарий:", row["scenario"])
+                c1, c2, c3, c4 = st.columns([1, 1, 1, 3])
+                with c1:
+                    status = st.selectbox("Статус", ["open","win","stop","be","closed"], index=["open","win","stop","be","closed"].index(row["status"]), key=f"st_{row['id']}")
+                with c2:
+                    res_r = st.number_input("Result R", value=float(row["result_r"]) if row["result_r"] is not None else 0.0, step=0.1, key=f"rr_{row['id']}")
+                with c3:
+                    if st.button("Сохранить", key=f"sv_{row['id']}"):
+                        journal_update_row(int(row["id"]), status, float(res_r), row.get("notes") or "")
+                        st.success("Сохранено.")
+                with c4:
+                    new_notes = st.text_area("Заметки/пояснение (почему win/stop)", value=row.get("notes") or "", key=f"nt_{row['id']}")
+                    if new_notes != (row.get("notes") or ""):
+                        journal_update_row(int(row["id"]), status, float(res_r), new_notes)
+                        st.toast("Заметка сохранена", icon="✍️")
 
-    # таблица
-    rows = []
-    for sc in scenarios:
-        key = f"{sc.name} ({sc.bias})"
-        rows.append({
-            "Сценарий": key,
-            "Тип": sc.etype,
-            "Подтв.": f"{sc.confirms} — {', '.join(sc.confirm_list)}",
-            "Вход": fmt_price(sc.entry, decimals),
-            "Стоп": fmt_price(sc.sl, decimals),
-            "TP1": fmt_price(sc.tp1, decimals),
-            "TP2": fmt_price(sc.tp2, decimals) if sc.tp2 else "—",
-            "R:R до TP1": round(abs(sc.tp1 - sc.entry) / max(abs(sc.entry - sc.sl), 1e-9), 2),
-            "Prob%": round(sc_probs.get(key, 0.0), 2),
-        })
-    if rows:
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.markdown("### Статистика")
+        dfj = journal_read_df()
+        total = len(dfj)
+        wins = int((dfj["status"] == "win").sum())
+        stops = int((dfj["status"] == "stop").sum())
+        be = int((dfj["status"] == "be").sum())
+        wr = (wins / max(wins + stops, 1)) * 100.0
+        avg_r = float(dfj["result_r"].dropna().mean()) if (dfj["result_r"].notna().any()) else 0.0
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Всего", total)
+        c2.metric("Win", wins)
+        c3.metric("Stop", stops)
+        c4.metric("Win-rate", f"{wr:.1f}%")
+        c5.metric("Средн. R", f"{avg_r:.2f}")
 
-    # подробные карточки по каждому сценарию
-    st.markdown("### Подробности по сценариям")
-    for sc in scenarios:
-        with st.expander(f"{sc.name} ({sc.bias}) — {sc.confirms} подтвержд.: {fmt_reason_list(sc.confirm_list)}"):
-            st.markdown(
-                f"**Логика:** {' → '.join(sc.logic_path)}  \n"
-                f"**Триггер:** {sc.trigger}  \n"
-                f"**Вход:** {fmt_price(sc.entry, decimals)}  \n"
-                f"**Стоп:** {fmt_price(sc.sl, decimals)} — {sc.stop_reason}  \n"
-                f"**TP1:** {fmt_price(sc.tp1, decimals)} — {sc.tp_reason}  \n"
-                f"**TP2:** {fmt_price(sc.tp2, decimals) if sc.tp2 else '—'}  \n"
-                f"**Замечание:** вход только при подтверждении свечой в пользу стороны; "
-                f"если импульс утащил цену и стоп стал чрезмерным — пропускаем."
-            )
-
-    summary.append(f"{asset} {tf} → режим {reg}; идей {len(scenarios)}; минимум подтверждений {min_confirms}")
-    st.divider()
-
-except Exception as e:
-    st.error(f"{asset}: {e}")
-
-st.subheader("Зведення")
-for line in summary:
-    st.write("•", line)
+        st.markdown("#### Разбивка по активу/стороне")
+        br = dfj.groupby(["asset","side"])["status"].value_counts().unstack(fill_value=0)
+        st.dataframe(br, use_container_width=True)
