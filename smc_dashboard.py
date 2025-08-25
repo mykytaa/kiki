@@ -43,6 +43,70 @@ def rsi(x: pd.Series, n=14):
     out = 100 - 100/(1+rs)
     return out.fillna(method="bfill").fillna(50)
 
+# ==== TradingView helpers (Pine v5 export) ====
+
+def _tv_symbol(symbol: str) -> str:
+    # подберите мэппинг под ваш источник данных
+    # обычный вариант для крипты на Binance:
+    m = {"BTCUSDT": "BINANCE:BTCUSDT", "ETHUSDT": "BINANCE:ETHUSDT"}
+    return m.get(symbol, symbol)
+
+def _tv_interval(tf: str) -> str:
+    return {"5m":"5","15m":"15","1h":"60"}.get(tf, "15")
+
+def tv_chart_url(symbol: str, tf: str) -> str:
+    return f"https://www.tradingview.com/chart/?symbol={_tv_symbol(symbol)}&interval={_tv_interval(tf)}"
+
+def pine_for_scenario(symbol: str, tf: str, sc) -> str:
+    """Генерим Pine v5 для отрисовки Entry/SL/TP1/TP2, стороны и R:R."""
+    side = "LONG" if sc.bias == "long" else "SHORT"
+    tvsym = _tv_symbol(symbol)
+    tfn = _tv_interval(tf)
+    return f"""//@version=5
+indicator("SMC Idea — {symbol} {tf} — {sc.name} ({side})", overlay=true, timeframe="{tfn}", timeframe_gaps=true)
+
+// ---- levels ----
+var float entry = {sc.entry}
+var float sl    = {sc.sl}
+var float tp1   = {sc.tp1}
+var float tp2   = {('na' if sc.tp2 is None else sc.tp2)}
+var string side = "{side}"
+var string name = "{sc.name}"
+
+// ---- styling ----
+col_entry = color.new(color.teal, 0)
+col_sl    = color.new(color.red, 0)
+col_tp1   = color.new(color.green, 0)
+col_tp2   = color.new(color.green, 30)
+
+// ---- plot ----
+plot(entry, "ENTRY", col_entry, 2, plot.style_linebr)
+plot(sl,    "SL",    col_sl,    2, plot.style_linebr)
+plot(tp1,   "TP1",   col_tp1,   2, plot.style_linebr)
+plot(tp2,   "TP2",   col_tp2,   2, plot.style_linebr)
+
+// ---- labels (появятся у последней свечи) ----
+if barstate.islast
+    label.new(bar_index, entry, "ENTRY\\n" + str.tostring(entry, format.mintick), style=label.style_label_left, color=col_entry, textcolor=color.white)
+    label.new(bar_index, sl,    "SL\\n" + str.tostring(sl, format.mintick),       style=label.style_label_left, color=col_sl, textcolor=color.white)
+    label.new(bar_index, tp1,   "TP1\\n" + str.tostring(tp1, format.mintick),     style=label.style_label_left, color=col_tp1, textcolor=color.white)
+    if not na(tp2)
+        label.new(bar_index, tp2, "TP2\\n" + str.tostring(tp2, format.mintick),   style=label.style_label_left, color=col_tp2, textcolor=color.white)
+
+// ---- info panel ----
+rr = math.abs(tp1 - entry) / math.abs(entry - sl)
+txt = name + " (" + side + ")\\n" +
+      "Entry: " + str.tostring(entry, format.mintick) + "\\n" +
+      "SL: "    + str.tostring(sl,    format.mintick) + "\\n" +
+      "TP1: "   + str.tostring(tp1,   format.mintick) + "\\n" +
+      "TP2: "   + (na(tp2) ? "—" : str.tostring(tp2, format.mintick)) + "\\n" +
+      "R:R to TP1 ≈ " + str.tostring(rr, format.mintick)
+var label panel = na
+if barstate.islast
+    panel := label.new(bar_index, high, txt, style=label.style_label_upper_left, textcolor=color.white, color=color.new(color.black, 0))
+"""
+
+
 def macd(x: pd.Series):
     f = ema(x, 12); s = ema(x, 26); m = f - s; sig = ema(m, 9)
     return m, sig, m - sig
@@ -538,6 +602,23 @@ def render_beginner_card(st, sc: Scenario, prob: float, atr_val: float):
         "- **Не входить, если:** импульс ушёл далеко и стоп становится чрезмерным, "
           "или цена закрепилась за уровнем, который должен был удерживаться."
     )
+
+    # --- Быстрый экспорт в TradingView ---
+pine_code = pine_for_scenario(s, tf, main_sc)
+st.markdown("**Экспорт в TradingView:**")
+st.code(pine_code, language="pine")  # у блока есть кнопка "Copy" справа
+
+st.download_button(
+    label="⬇️ Скачать .pine",
+    data=pine_code.encode("utf-8"),
+    file_name=f"{s}_{tf}_{main_sc.name.replace(' ','_')}.pine",
+    mime="text/plain",
+    use_container_width=False
+)
+
+st.link_button("📈 Открыть график TradingView", tv_chart_url(s, tf))
+st.caption("Открой ссылку, вставь код в Pine Editor (New > Paste > Save), затем 'Add to chart'.")
+
 
 # ========= Data via yfinance (фикс многомерных колонок) =========
 @st.cache_data(show_spinner=False, ttl=50)
