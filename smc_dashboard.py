@@ -9,7 +9,6 @@ Beginner-карточка + подробное «market story» + справоч
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -33,7 +32,8 @@ LTF_LIMIT = 600
 HTF_LIMIT = 400
 
 # ========= Utils & indicators =========
-def ema(x: pd.Series, n: int): return x.ewm(span=n, adjust=False).mean()
+def ema(x: pd.Series, n: int): 
+    return x.ewm(span=n, adjust=False).mean()
 
 def rsi(x: pd.Series, n=14):
     d = x.diff()
@@ -43,28 +43,60 @@ def rsi(x: pd.Series, n=14):
     out = 100 - 100/(1+rs)
     return out.fillna(method="bfill").fillna(50)
 
-# ==== TradingView helpers (Pine v5 export) ====
+def macd(x: pd.Series):
+    f = ema(x, 12); s = ema(x, 26); m = f - s; sig = ema(m, 9)
+    return m, sig, m - sig
 
+def atr(df: pd.DataFrame, n=14):
+    c = df["close"]
+    tr = pd.concat(
+        [
+            (df["high"] - df["low"]),
+            (df["high"] - c.shift()).abs(),
+            (df["low"] - c.shift()).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return tr.ewm(alpha=1 / n, adjust=False).mean()
+
+def obv(df: pd.DataFrame) -> pd.Series:
+    sign = np.sign(df["close"].diff().fillna(0.0))
+    return (sign * df["volume"]).cumsum()
+
+def adx(df: pd.DataFrame, n: int = 14) -> pd.Series:
+    up = df["high"].diff(); dn = -df["low"].diff()
+    plus_dm = np.where((up > dn) & (up > 0), up, 0.0)
+    minus_dm = np.where((dn > up) & (dn > 0), dn, 0.0)
+    tr = pd.concat(
+        [
+            (df["high"] - df["low"]),
+            (df["high"] - df["close"].shift()).abs(),
+            (df["low"] - df["close"].shift()).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    atr_s = tr.ewm(alpha=1 / n, adjust=False).mean()
+    pdi = 100 * pd.Series(plus_dm, index=df.index).ewm(alpha=1 / n, adjust=False).mean() / atr_s
+    mdi = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=1 / n, adjust=False).mean() / atr_s
+    dx = 100 * (pdi.subtract(mdi).abs() / (pdi + mdi).replace(0, np.nan))
+    return dx.ewm(alpha=1 / n, adjust=False).mean().fillna(20)
+
+# ========= TradingView helpers (Pine v5 export) =========
 def _tv_symbol(symbol: str) -> str:
-    # подберите мэппинг под ваш источник данных
-    # обычный вариант для крипты на Binance:
     m = {"BTCUSDT": "BINANCE:BTCUSDT", "ETHUSDT": "BINANCE:ETHUSDT"}
     return m.get(symbol, symbol)
 
 def _tv_interval(tf: str) -> str:
-    return {"5m":"5","15m":"15","1h":"60"}.get(tf, "15")
+    return {"5m": "5", "15m": "15", "1h": "60"}.get(tf, "15")
 
 def tv_chart_url(symbol: str, tf: str) -> str:
     return f"https://www.tradingview.com/chart/?symbol={_tv_symbol(symbol)}&interval={_tv_interval(tf)}"
 
 def pine_for_scenario(symbol: str, tf: str, sc) -> str:
-    """Генерим Pine v5 для отрисовки Entry/SL/TP1/TP2, стороны и R:R."""
     side = "LONG" if sc.bias == "long" else "SHORT"
-    tvsym = _tv_symbol(symbol)
     tfn = _tv_interval(tf)
     return f"""//@version=5
 indicator("SMC Idea — {symbol} {tf} — {sc.name} ({side})", overlay=true, timeframe="{tfn}", timeframe_gaps=true)
-
 // ---- levels ----
 var float entry = {sc.entry}
 var float sl    = {sc.sl}
@@ -72,27 +104,23 @@ var float tp1   = {sc.tp1}
 var float tp2   = {('na' if sc.tp2 is None else sc.tp2)}
 var string side = "{side}"
 var string name = "{sc.name}"
-
 // ---- styling ----
 col_entry = color.new(color.teal, 0)
 col_sl    = color.new(color.red, 0)
 col_tp1   = color.new(color.green, 0)
 col_tp2   = color.new(color.green, 30)
-
 // ---- plot ----
 plot(entry, "ENTRY", col_entry, 2, plot.style_linebr)
 plot(sl,    "SL",    col_sl,    2, plot.style_linebr)
 plot(tp1,   "TP1",   col_tp1,   2, plot.style_linebr)
 plot(tp2,   "TP2",   col_tp2,   2, plot.style_linebr)
-
-// ---- labels (появятся у последней свечи) ----
+// ---- labels ----
 if barstate.islast
     label.new(bar_index, entry, "ENTRY\\n" + str.tostring(entry, format.mintick), style=label.style_label_left, color=col_entry, textcolor=color.white)
     label.new(bar_index, sl,    "SL\\n" + str.tostring(sl, format.mintick),       style=label.style_label_left, color=col_sl, textcolor=color.white)
     label.new(bar_index, tp1,   "TP1\\n" + str.tostring(tp1, format.mintick),     style=label.style_label_left, color=col_tp1, textcolor=color.white)
     if not na(tp2)
         label.new(bar_index, tp2, "TP2\\n" + str.tostring(tp2, format.mintick),   style=label.style_label_left, color=col_tp2, textcolor=color.white)
-
 // ---- info panel ----
 rr = math.abs(tp1 - entry) / math.abs(entry - sl)
 txt = name + " (" + side + ")\\n" +
@@ -106,57 +134,22 @@ if barstate.islast
     panel := label.new(bar_index, high, txt, style=label.style_label_upper_left, textcolor=color.white, color=color.new(color.black, 0))
 """
 
-
-def macd(x: pd.Series):
-    f = ema(x, 12); s = ema(x, 26); m = f - s; sig = ema(m, 9)
-    return m, sig, m - sig
-
-def atr(df: pd.DataFrame, n=14):
-    c = df["close"]
-    tr = pd.concat(
-        [(df["high"]-df["low"]),
-         (df["high"]-c.shift()).abs(),
-         (df["low"]-c.shift()).abs()],
-        axis=1
-    ).max(axis=1)
-    return tr.ewm(alpha=1/n, adjust=False).mean()
-
-def obv(df: pd.DataFrame) -> pd.Series:
-    sign = np.sign(df["close"].diff().fillna(0.0))
-    return (sign*df["volume"]).cumsum()
-
-def adx(df: pd.DataFrame, n: int = 14) -> pd.Series:
-    up = df["high"].diff(); dn = -df["low"].diff()
-    plus_dm = np.where((up>dn) & (up>0), up, 0.0)
-    minus_dm = np.where((dn>up) & (dn>0), dn, 0.0)
-    tr = pd.concat(
-        [(df["high"]-df["low"]),
-         (df["high"]-df["close"].shift()).abs(),
-         (df["low"]-df["close"].shift()).abs()],
-        axis=1
-    ).max(axis=1)
-    atr_s = tr.ewm(alpha=1/n, adjust=False).mean()
-    pdi = 100*pd.Series(plus_dm, index=df.index).ewm(alpha=1/n, adjust=False).mean()/atr_s
-    mdi = 100*pd.Series(minus_dm, index=df.index).ewm(alpha=1/n, adjust=False).mean()/atr_s
-    dx = 100*(pdi.subtract(mdi).abs() / (pdi+mdi).replace(0, np.nan))
-    return dx.ewm(alpha=1/n, adjust=False).mean().fillna(20)
-
 # ========= Volume Profile (approx) =========
 def volume_profile(df: pd.DataFrame, bins: int = 40) -> Dict[str, float | np.ndarray]:
     lo = float(df["low"].min()); hi = float(df["high"].max())
-    if hi<=lo: hi = lo+1e-6
-    edges = np.linspace(lo, hi, bins+1); vol = np.zeros(bins)
+    if hi <= lo: hi = lo + 1e-6
+    edges = np.linspace(lo, hi, bins + 1); vol = np.zeros(bins)
     prices = df["close"].values; vols = df["volume"].values
-    idx = np.clip(np.digitize(prices, edges)-1, 0, bins-1)
-    for i, v in zip(idx, vols): vol[i]+=v
-    total = max(vol.sum(),1.0)
-    poc_i = int(vol.argmax()); poc = (edges[poc_i]+edges[poc_i+1])/2
-    area=[poc_i]; L=poc_i-1; R=poc_i+1; acc=vol[poc_i]
-    while acc<0.7*total and (L>=0 or R<bins):
-        if R>=bins or (L>=0 and vol[L]>=vol[R]): area.append(L); acc+=vol[L]; L-=1
-        else: area.append(R); acc+=vol[R]; R+=1
-    val = edges[max(min(area),0)]; vah = edges[min(max(area)+1,bins)]
-    return {"edges":edges,"volume":vol,"poc":float(poc),"val":float(val),"vah":float(vah)}
+    idx = np.clip(np.digitize(prices, edges) - 1, 0, bins - 1)
+    for i, v in zip(idx, vols): vol[i] += v
+    total = max(vol.sum(), 1.0)
+    poc_i = int(vol.argmax()); poc = (edges[poc_i] + edges[poc_i + 1]) / 2
+    area = [poc_i]; L = poc_i - 1; R = poc_i + 1; acc = vol[poc_i]
+    while acc < 0.7 * total and (L >= 0 or R < bins):
+        if R >= bins or (L >= 0 and vol[L] >= vol[R]): area.append(L); acc += vol[L]; L -= 1
+        else: area.append(R); acc += vol[R]; R += 1
+    val = edges[max(min(area), 0)]; vah = edges[min(max(area) + 1, bins)]
+    return {"edges": edges, "volume": vol, "poc": float(poc), "val": float(val), "vah": float(vah)}
 
 def liquidity_pools(df, SH, SL, win=260):
     rec = df.iloc[-win:]
@@ -171,7 +164,7 @@ def vwap_series(df: pd.DataFrame) -> pd.Series:
     num = (tp*vol).cumsum(); den = vol.cumsum().replace(0, np.nan)
     return (num/den).fillna(method="bfill").fillna(df["close"])
 
-# ========= SMC primitives (фракталы L=3/R=3) =========
+# ========= SMC primitives =========
 def swings(df: pd.DataFrame, L=3, R=3):
     hi=df["high"].values; lo=df["low"].values; n=len(df)
     SH=np.zeros(n,bool); SL=np.zeros(n,bool)
@@ -180,7 +173,6 @@ def swings(df: pd.DataFrame, L=3, R=3):
         if lo[i]==lo[i-L:i+R+1].min(): SL[i]=True
     return pd.Series(SH, df.index), pd.Series(SL, df.index)
 
-# BOS с подтверждением: закрытие за уровнем ≥ confirm_mult*ATR
 def bos(df, SH, SL, look=200, confirm_mult=0.30):
     recent = df.iloc[-look:]
     sh_idx = recent[SH.loc[recent.index]].index
@@ -287,7 +279,7 @@ class Scenario:
 TREND_TYPES = ("FVG","BOS","OB Retest","EMA Pullback","Structure Breakout","VWAP","POC Flip","SFP")
 RANGE_TYPES = ("Value Area","Breaker")
 
-# — разнообразное объяснение сетапов
+# — объяснения
 def explain_scenario(name: str, bias: str, details: Dict[str, float | str]) -> str:
     side="LONG" if bias=="long" else "SHORT"; parts=[]
     if name=="FVG mitigation":
@@ -443,7 +435,7 @@ def propose(df: pd.DataFrame, htf_bias: str, d_bias: str, regime: str,
             sc.append(Scenario("POC Flip","short","limit","ретест POC снизу",e,sl,tp1,tp2,rr,
                                explain_scenario("POC Flip","short",{})))
 
-    # SFP (swing failure)
+    # SFP
     if sh_lvl is not None and df["high"].iloc[-1]>sh_lvl and df["close"].iloc[-1]<sh_lvl:
         e=sh_lvl-0.1*at; sl=sh_lvl+0.9*at; tp1,tp2,rr=rr_targets(e,sl,"short")
         sc.append(Scenario("SFP Reversal","short","stop",f"SFP у {sh_lvl:.2f}",e,sl,tp1,tp2,rr,
@@ -473,7 +465,7 @@ def propose(df: pd.DataFrame, htf_bias: str, d_bias: str, regime: str,
                              "Пауза: дождаться свипа/ретеста ключевых уровней."))
     return uniq
 
-# ========= Probabilities (по конфлюэнсам) =========
+# ========= Probabilities =========
 def scenario_probabilities(
     scen: List[Scenario], htf_bias: str, d_bias: str, obv_slope: float,
     price: float, vp: Dict[str,float|np.ndarray], atr_val: float, regime: str,
@@ -524,7 +516,6 @@ def market_story(df: pd.DataFrame, df_h: pd.DataFrame, df_d: pd.DataFrame,
     poc_state="выше VAH" if price>vp["vah"] else ("ниже VAL" if price<vp["val"] else "внутри value area")
     bias_ltf=score_bias(df); bias_htf=score_bias(df_h); bias_d=regime_daily(df_d)
 
-    # простенькие дивергенции RSI по последним двум swing-high/low
     SH,SL=swings(df)
     def _last_two(levels: pd.Series) -> List[pd.Timestamp]:
         idx=levels[levels].index; return list(idx[-2:]) if len(idx)>=2 else list(idx)
@@ -588,7 +579,7 @@ def make_beginner_summary(symbol: str, tf: str, price: float,
         f"SHORT {_fmt_pct(long_vs_short.get('short',0))}."
     )
 
-def render_beginner_card(st, sc: Scenario, prob: float, atr_val: float):
+def render_beginner_card(st, sc: Scenario, prob: float, atr_val: float, symbol: str, tf: str):
     rr_to_tp1=_rr(sc.entry,sc.sl,sc.tp1); side="ПОКУПКА (LONG)" if sc.bias=="long" else "ПРОДАЖА (SHORT)"
     atr_note=f"~{_fmt_price(atr_val)} по цене (ATR)."
     st.markdown(f"### Что сделать сейчас — {side}")
@@ -603,24 +594,21 @@ def render_beginner_card(st, sc: Scenario, prob: float, atr_val: float):
           "или цена закрепилась за уровнем, который должен был удерживаться."
     )
 
-    # --- Быстрый экспорт в TradingView ---
-pine_code = pine_for_scenario(s, tf, main_sc)
-st.markdown("**Экспорт в TradingView:**")
-st.code(pine_code, language="pine")  # у блока есть кнопка "Copy" справа
+    # --- Быстрый экспорт в TradingView (теперь ВНУТРИ карточки и с нужными переменными) ---
+    pine_code = pine_for_scenario(symbol, tf, sc)
+    st.markdown("**Экспорт в TradingView:**")
+    st.code(pine_code, language="pine")
+    st.download_button(
+        label="⬇️ Скачать .pine",
+        data=pine_code.encode("utf-8"),
+        file_name=f"{symbol}_{tf}_{sc.name.replace(' ','_')}.pine",
+        mime="text/plain",
+        use_container_width=False
+    )
+    st.link_button("📈 Открыть график TradingView", tv_chart_url(symbol, tf))
+    st.caption("Открой ссылку, вставь код в Pine Editor (New > Paste > Save), затем 'Add to chart'.")
 
-st.download_button(
-    label="⬇️ Скачать .pine",
-    data=pine_code.encode("utf-8"),
-    file_name=f"{s}_{tf}_{main_sc.name.replace(' ','_')}.pine",
-    mime="text/plain",
-    use_container_width=False
-)
-
-st.link_button("📈 Открыть график TradingView", tv_chart_url(s, tf))
-st.caption("Открой ссылку, вставь код в Pine Editor (New > Paste > Save), затем 'Add to chart'.")
-
-
-# ========= Data via yfinance (фикс многомерных колонок) =========
+# ========= Data via yfinance =========
 @st.cache_data(show_spinner=False, ttl=50)
 def binance_klines(symbol: str, interval: str, limit: int = 800) -> pd.DataFrame:
     yf_symbol = TICKER_MAP.get(symbol, symbol)
@@ -628,19 +616,24 @@ def binance_klines(symbol: str, interval: str, limit: int = 800) -> pd.DataFrame
 
     df = yf.download(yf_symbol, interval=yf_interval, period=yf_period,
                      auto_adjust=False, progress=False)
-    if df.empty: raise RuntimeError(f"yfinance: пустые данные для {yf_symbol} @ {yf_interval}/{yf_period}")
-    if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+    if df.empty: 
+        raise RuntimeError(f"yfinance: пустые данные для {yf_symbol} @ {yf_interval}/{yf_period}")
+    if isinstance(df.columns, pd.MultiIndex): 
+        df.columns = df.columns.get_level_values(0)
 
     df = df.rename(columns={"Open":"open","High":"high","Low":"low","Close":"close","Adj Close":"adj_close","Volume":"volume"})
     need=["open","high","low","close","volume"]
     for c in need:
         if c not in df.columns:
             df[c] = 0.0 if c=="volume" else np.nan
-        if isinstance(df[c], pd.DataFrame): df[c]=df[c].iloc[:,0]
+        if isinstance(df[c], pd.DataFrame): 
+            df[c]=df[c].iloc[:,0]
         df[c]=pd.to_numeric(df[c], errors="coerce")
     try:
-        if df.index.tz is None: df.index=pd.to_datetime(df.index, utc=True)
-        else: df.index=df.index.tz_convert("UTC")
+        if df.index.tz is None: 
+            df.index=pd.to_datetime(df.index, utc=True)
+        else: 
+            df.index=df.index.tz_convert("UTC")
     except Exception:
         df.index=pd.to_datetime(df.index, utc=True)
 
@@ -706,7 +699,6 @@ for s in SYMBOLS:
         reg   = market_regime(df, vp)
         atr_v = float(atr(df).iloc[-1])
 
-        # поток объёма (наклон OBV для вероятностей)
         o=obv(df); wnd=min(len(o),160)
         slope = (np.polyfit(np.arange(wnd), o.tail(wnd), 1)[0] if wnd>=20 else 0.0)
 
@@ -754,7 +746,7 @@ for s in SYMBOLS:
             if main_sc is None:
                 main_sc=[x for x in scenarios if not x.name.startswith("Wait")][0]
                 main_prob=sc_probs.get(f"{main_sc.name} ({main_sc.bias})",0.0)
-            render_beginner_card(st, main_sc, main_prob, atr_v)
+            render_beginner_card(st, main_sc, main_prob, atr_v, s, tf)
 
         # Таблица сценариев
         rows=[]
