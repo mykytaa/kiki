@@ -27,9 +27,13 @@ def macd(x): f=ema(x,12); s=ema(x,26); m=f-s; return m,ema(m,9),m-ema(m,9)
 def atr(df,n=14): c=df.close; tr=pd.concat([(df.high-df.low),(df.high-c.shift()).abs(),(df.low-c.shift()).abs()],axis=1).max(axis=1); return tr.ewm(alpha=1/n,adjust=False).mean()
 def obv(df): s=np.sign(df.close.diff().fillna(0.0)); return (s*df.volume).cumsum()
 def adx(df,n=14): up=df.high.diff(); dn=-df.low.diff(); plus=np.where((up>dn)&(up>0),up,0.0); minus=np.where((dn>up)&(dn>0),dn,0.0); tr=pd.concat([(df.high-df.low),(df.high-df.close.shift()).abs(),(df.low-df.close.shift()).abs()],axis=1).max(axis=1); a=tr.ewm(alpha=1/n,adjust=False).mean(); p=100*pd.Series(plus,index=df.index).ewm(alpha=1/n,adjust=False).mean()/a; m=100*pd.Series(minus,index=df.index).ewm(alpha=1/n,adjust=False).mean()/a; d=100*(p.subtract(m).abs()/(p+m).replace(0,np.nan)); return d.ewm(alpha=1/n,adjust=False).mean().fillna(20)
-def slope_series(s,last_n=80): n=min(len(s),last_n); 
- if n<8: return 0.0
- y=s.tail(n).values; x=np.arange(n,dtype=float); return float(np.polyfit(x,y,1)[0])
+def slope_series(s,last_n=80):
+    n = min(len(s), last_n)
+    if n < 8:
+        return 0.0
+    y = s.tail(n).values
+    x = np.arange(n, dtype=float)
+    return float(np.polyfit(x, y, 1)[0])
 def volume_profile(df,bins=40):
  lo=float(df.low.min()); hi=float(df.high.max()); 
  if hi<=lo: hi=lo+1e-6
