@@ -137,9 +137,17 @@ def score_bias(df):
  if h>0:s+=1
  elif h<0:s-=1
  return "long" if s>=1 else ("short" if s<=-1 else "none")
-def regime_daily(df_d): e50=ema(df_d.close,50).iloc[-1]; e200=ema(df_d.close,200).iloc[-1]; 
- if np.isnan(e50) or np.isnan(e200): return "none"
- return "long" if e50>e200 else "short" if e50<e200 else "none"
+def regime_daily(df_d):
+    e50 = ema(df_d.close, 50).iloc[-1]
+    e200 = ema(df_d.close, 200).iloc[-1]
+    if np.isnan(e50) or np.isnan(e200):
+        return "none"
+    if e50 > e200:
+        return "long"
+    elif e50 < e200:
+        return "short"
+    else:
+        return "none"
 def market_regime(df,vp): ad=float(adx(df).iloc[-1]); p=float(df.close.iloc[-1]); outside=(p>vp["vah"]) or (p<vp["val"]); return "trend" if (ad>=22 or outside) else "range"
 
 # ========= Правила подтверждений (в SQLite) + загрузка/сохранение
