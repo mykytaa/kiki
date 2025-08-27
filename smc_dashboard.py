@@ -2,9 +2,13 @@
 # -*- coding: utf-8 -*-
 
 """
-SMC Intraday — BTC / ETH / XAUUSD / XAUEUR / EURUSD (text)
+SMC Intraday — BTC / ETH / XAUUSD / XAUEUR / EURUSD
 Конфлюенсы SFP/BOS/FVG(+iFVG)/BPR, строгая валидация, журнал (SQLite),
 TG-уведомления (анти-спам), вкладки: Сигналы / Журнал / Статистика / Правила.
+Добавлено:
+- «Живые и свежие» сигналы: используем только открытые (не закрытые) FVG и недавние SFP/BOS.
+- Разметка на графике: FVG (bull/bear), iFVG, SFP (свипы), BOS, OB, VAL/POC/VAH.
+- Улучшенный скоринг и фильтры качества (объёмный всплеск, свежесть, открытый FVG, HTF/Daily bias).
 """
 
 from __future__ import annotations
@@ -17,6 +21,7 @@ import pandas as pd
 import streamlit as st
 import yfinance as yf
 import requests
+import plotly.graph_objects as go
 
 # ========= Конфиг
 ASSETS = ["EURUSD", "BTCUSDT", "ETHUSDT", "XAUUSD", "XAUEUR"]
@@ -36,7 +41,7 @@ HTF_OF = {"5m": "15m", "15m": "60m", "1h": "1d"}
 DB = "smc_journal.sqlite"
 
 # Telegram по умолчанию (можно стереть/поменять в UI)
-TG_DEFAULT_TOKEN = "6231361993:AAFCKT2rPnoJv2K4OXAZCpOq8KcjmFGvJjw"
+TG_DEFAULT_TOKEN = "REPLACE_ME"
 
 # ========= Индикаторы / утилы
 ema = lambda x, n: x.ewm(span=n, adjust=False).mean()
@@ -155,19 +160,36 @@ def fvg(df, look=140):
     hi, lo, idx = df.high.values, df.low.values, df.index
     n = len(df); s = max(2, n-look)
     for i in range(s, n):
-        if i-2 >= 0 and lo[i] > hi[i-2]: out["bull"].append((idx[i], hi[i-2], lo[i]))
-        if i-2 >= 0 and hi[i] < lo[i-2]: out["bear"].append((idx[i], hi[i], lo[i-2]))
+        if i-2 >= 0 and lo[i] > hi[i-2]: out["bull"].append((idx[i], hi[i-2], lo[i]))   # (t, lo, hi)
+        if i-2 >= 0 and hi[i] < lo[i-2]: out["bear"].append((idx[i], hi[i], lo[i-2]))   # (t, lo, hi)
     return out
 
-# ========= Расширенные подтверждения
+# ========= Расширенные подтверждения и «свежесть»
 def is_impulse_bar(df, i, atr_val, impulse_mult=1.2):
     rng = float(df.high.iloc[i]-df.low.iloc[i])
     return rng >= impulse_mult*float(atr_val)
 
+def fvg_open_only(df, gaps):
+    """Вернуть только открытые (ещё не тронутые) FVG с момента появления до текущего бара."""
+    bulls, bears = [], []
+    for t, lo, hi in gaps.get("bull", []):
+        post = df[df.index > t]
+        open_ = True
+        if len(post):
+            open_ = float(post.low.min()) > hi  # не касались верхней границы гэпа
+        if open_: bulls.append((t, lo, hi))
+    for t, lo, hi in gaps.get("bear", []):
+        post = df[df.index > t]
+        open_ = True
+        if len(post):
+            open_ = float(post.high.max()) < lo  # не касались нижней границы гэпа
+        if open_: bears.append((t, lo, hi))
+    return {"bull": bulls, "bear": bears}
+
 def detect_iFVG(df, gaps, direction, atr_val, min_depth_atr=0.3, impulse_mult=1.2):
     arr = gaps["bull"] if direction=="up" else gaps["bear"]
     if not arr: return None
-    t, lo, hi = list(arr)[-1]  # самый свежий
+    t, lo, hi = list(arr)[-1]  # самый свежий открытый FVG
     j = df.index.get_indexer([t])[0]
     if j-1 < 0: return None
     if not is_impulse_bar(df, j, atr_val, impulse_mult): return None
@@ -237,10 +259,12 @@ def market_regime(df, vp):
 
 # ========= Правила подтверждений
 DEFAULT_RULES = {
-    "windows": {"SFP":120, "BOS":120, "FVG":80, "iFVG":80, "BPR":80},
-    "min_depth_atr": 0.3,
-    "impulse_mult": 1.2,
+    "windows": {"SFP":140, "BOS":140, "FVG":120, "iFVG":120, "BPR":120},
+    "fresh_bars": {"SFP":120, "BOS":120, "FVG":120},  #  только свежие объекты
+    "min_depth_atr": 0.35,
+    "impulse_mult": 1.25,
     "need_poc_side": True,
+    "vol_spike_mult": 1.3,
     "weights": {"base":1.0, "obv_align":0.5, "ema_trend":0.5, "poc_side":0.4, "vwap_near":0.3, "divergence":0.4},
     "min_confirms": 3
 }
@@ -328,7 +352,7 @@ class Scenario:
     entry:float; sl:float; tp1:float; tp2:Optional[float]
     rr:str; confirms:int; confirm_list:List[str]
     explain_short:str; stop_reason:str; tp_reason:str
-    logic_path:List[str]; status:str; missing:List[str]
+    logic_path:List[str]; status:str; missing:List[str]; t_key:Optional[pd.Timestamp]=None
 
 def rr_targets(entry, sl, bias, min_rr=2.0):
     risk = abs(entry-sl) or 1e-9
@@ -336,11 +360,17 @@ def rr_targets(entry, sl, bias, min_rr=2.0):
             entry+3.0*risk     if bias=="long" else entry-3.0*risk,
             f"1:{int(min_rr)}/1:3")
 
+def _vol_spike(df, mult=1.3):
+    if "volume" not in df.columns or df.volume.isna().all(): return False
+    v = float(df.volume.iloc[-1]); ve = float(ema(df.volume.fillna(0.0), 20).iloc[-1] or 0.0)
+    return ve>0 and v >= mult*ve
+
 def propose(df, rules, htf_bias, d_bias, regime, vp, asset, tf) -> List[Scenario]:
     price = float(df.close.iloc[-1]); at = float(atr(df).iloc[-1]); at = max(at, 1e-9)
-    SH, SL = swings(df); dir_bos, t_bos, lvl_bos = bos(df, SH, SL)
-    gaps = fvg(df); swp = sweeps(df, SH, SL)
-    sh_lvl, sl_lvl = last_swings(df, SH, SL)
+    SH, SL = swings(df); dir_bos, t_bos, lvl_bos = bos(df, SH, SL, look=max(140, rules["windows"]["BOS"]))
+    gaps_raw = fvg(df, look=max(140, rules["windows"]["FVG"]))
+    gaps = fvg_open_only(df, gaps_raw)  # только открытые FVG — «живые»
+    swp = sweeps(df, SH, SL, win=max(140, rules["windows"]["SFP"]))
     ema20 = float(ema(df.close, 20).iloc[-1])
     vw    = float(vwap_series(df).iloc[-1])
     obv_rsi = obv_rsi_divergence(df, look=max(40, rules["windows"]["FVG"]))
@@ -356,6 +386,9 @@ def propose(df, rules, htf_bias, d_bias, regime, vp, asset, tf) -> List[Scenario
         if abs(entry-vw) <= 0.6*at: out.append("рядом VWAP")
         if (obv_rsi["price_slope"]>0 and obv_rsi["rsi_slope"]<0) or (obv_rsi["price_slope"]<0 and obv_rsi["rsi_slope"]>0):
             out.append("RSI дивергенция")
+        if _vol_spike(df, rules.get("vol_spike_mult", 1.3)): out.append("всплеск объёма")
+        if htf_bias==bias: out.append("HTF согласован")
+        if d_bias==bias: out.append("Daily согласован")
         return out
 
     scenarios: List[Scenario] = []
@@ -365,45 +398,53 @@ def propose(df, rules, htf_bias, d_bias, regime, vp, asset, tf) -> List[Scenario
     i_fvg_dn = detect_iFVG(df, gaps, "down", at, rules["min_depth_atr"], rules["impulse_mult"])
     bpr_zone = detect_bpr(gaps)
 
-    # 1) SFP → BOS → FVG (вход по mid 0.5)
-    if (swp["low"] and dir_bos=="up") or (swp["high"] and dir_bos=="down"):
-        direction = "long" if dir_bos=="up" else "short"
-        fvg_ok, _ = strict_fvg_validate("up" if direction=="long" else "down", gaps,
-                                        price=price, vp=vp, atr_val=at, bos_time=t_bos,
-                                        min_depth_atr=rules["min_depth_atr"], need_side=need_side)
-        if fvg_ok:
-            t, lo, hi = fvg_ok; mid = (lo+hi)/2
-            entry = mid
-            sl = (swp["low"][-1][1]-0.7*at) if direction=="long" else (swp["high"][-1][1]+0.7*at)
-            tp1, tp2, rr = rr_targets(entry, sl, direction)
-            base = ["SFP", "BOS", "FVG валиден"]; generic = gen_conf(direction, entry)
-            confirms = base + generic; missing = []
-            status = "ok" if len(set(base)) >= 3 else "await"
-            add(name="SFP→BOS→FVG", bias=direction, etype="limit", trigger=f"касание mid FVG {mid:.5f}",
-                entry=float(entry), sl=float(sl), tp1=float(tp1), tp2=float(tp2), rr=rr,
-                confirms=len(set(confirms)), confirm_list=confirms, explain_short="срыв→пробой→имбаланс (0.5)",
-                stop_reason="за SFP ±0.7×ATR", tp_reason="структурная цель/POC", logic_path=["SFP","BOS","FVG"],
-                status=status, missing=missing)
-
-    # 2) BOS → OB ретест (+iFVG/BPR)
+    # Вспом. — последний OB перед BOS
     def ob_block(dir_):
-        before = df[df.index < (t_bos if t_bos else df.index[-1])].iloc[-70:]
+        if not t_bos: return None
+        before = df[df.index < t_bos].iloc[-70:]
         if dir_=="up":
             reds = before[before.close < before.open]
             if len(reds):
                 last = reds.iloc[-1]
-                return (float(min(last.open,last.close)), float(max(last.open,last.close)))
+                return (last.name, float(min(last.open,last.close)), float(max(last.open,last.close)))
         else:
             greens = before[before.close > before.open]
             if len(greens):
                 last = greens.iloc[-1]
-                return (float(min(last.open,last.close)), float(max(last.open,last.close)))
+                return (last.name, float(min(last.open,last.close)), float(max(last.open,last.close)))
         return None
 
-    if dir_bos=="up":
+    # Свежесть: последние N баров от правила
+    freshS = rules["fresh_bars"]["SFP"]; freshB = rules["fresh_bars"]["BOS"]; freshF = rules["fresh_bars"]["FVG"]
+    last_idx = df.index[-1]
+
+    # 1) SFP → BOS → FVG (вход по mid 0.5)
+    if (swp["low"] and dir_bos=="up") or (swp["high"] and dir_bos=="down"):
+        sfp_t = (swp["low"][-1][0] if dir_bos=="up" else swp["high"][-1][0])
+        if (last_idx - sfp_t) <= pd.Timedelta(minutes=5*max(1, freshS//df.index.to_series().diff().dt.total_seconds().dropna().median()/60 or 1)):
+            direction = "long" if dir_bos=="up" else "short"
+            fvg_ok, _ = strict_fvg_validate("up" if direction=="long" else "down", gaps,
+                                            price=price, vp=vp, atr_val=at, bos_time=t_bos,
+                                            min_depth_atr=rules["min_depth_atr"], need_side=need_side)
+            if fvg_ok and (last_idx - fvg_ok[0]) <= pd.Timedelta(minutes=5*max(1, freshF//1)):
+                t, lo, hi = fvg_ok; mid = (lo+hi)/2
+                entry = mid
+                sl = (swp["low"][-1][1]-0.7*at) if direction=="long" else (swp["high"][-1][1]+0.7*at)
+                tp1, tp2, rr = rr_targets(entry, sl, direction)
+                base = ["SFP", "BOS", "FVG валиден"]; generic = gen_conf(direction, entry)
+                confirms = base + generic; missing = []
+                status = "ok" if len(set(base)) >= 3 else "await"
+                add(name="SFP→BOS→FVG", bias=direction, etype="limit", trigger=f"касание mid FVG {mid:.5f}",
+                    entry=float(entry), sl=float(sl), tp1=float(tp1), tp2=float(tp2), rr=rr,
+                    confirms=len(set(confirms)), confirm_list=confirms, explain_short="срыв→пробой→имбаланс (0.5)",
+                    stop_reason="за SFP ±0.7×ATR", tp_reason="структурная цель/POC", logic_path=["SFP","BOS","FVG"],
+                    status=status, missing=[], t_key=t)
+
+    # 2) BOS → OB ретест (+iFVG/BPR)
+    if dir_bos=="up" and t_bos and (last_idx - t_bos) <= pd.Timedelta(minutes=5*max(1, freshB//1)):
         ob = ob_block("up")
         if ob:
-            lo, hi = ob; entry = hi; sl = lo-0.6*at; tp1, tp2, rr = rr_targets(entry, sl, "long")
+            t_ob, lo, hi = ob; entry = hi; sl = lo-0.6*at; tp1, tp2, rr = rr_targets(entry, sl, "long")
             extra=[]; 
             if i_fvg_up: extra.append("iFVG")
             if bpr_zone: extra.append("BPR")
@@ -414,12 +455,12 @@ def propose(df, rules, htf_bias, d_bias, regime, vp, asset, tf) -> List[Scenario
                 entry=float(entry), sl=float(sl), tp1=float(tp1), tp2=float(tp2), rr=rr,
                 confirms=len(set(confirms)), confirm_list=confirms, explain_short="пробой и ретест спроса (+iFVG/BPR)",
                 stop_reason="за OB −0.6×ATR", tp_reason="структурная цель/POC",
-                logic_path=["BOS","OB","iFVG/BPR"], status=status, missing=[])
+                logic_path=["BOS","OB","iFVG/BPR"], status=status, missing=[], t_key=t_ob)
 
-    if dir_bos=="down":
+    if dir_bos=="down" and t_bos and (last_idx - t_bos) <= pd.Timedelta(minutes=5*max(1, freshB//1)):
         ob = ob_block("down")
         if ob:
-            lo, hi = ob; entry = lo; sl = hi+0.6*at; tp1, tp2, rr = rr_targets(entry, sl, "short")
+            t_ob, lo, hi = ob; entry = lo; sl = hi+0.6*at; tp1, tp2, rr = rr_targets(entry, sl, "short")
             extra=[]; 
             if i_fvg_dn: extra.append("iFVG")
             if bpr_zone: extra.append("BPR")
@@ -430,26 +471,30 @@ def propose(df, rules, htf_bias, d_bias, regime, vp, asset, tf) -> List[Scenario
                 entry=float(entry), sl=float(sl), tp1=float(tp1), tp2=float(tp2), rr=rr,
                 confirms=len(set(confirms)), confirm_list=confirms, explain_short="пробой и ретест предложения (+iFVG/BPR)",
                 stop_reason="за OB +0.6×ATR", tp_reason="структурная цель/POC",
-                logic_path=["BOS","OB","iFVG/BPR"], status=status, missing=[])
+                logic_path=["BOS","OB","iFVG/BPR"], status=status, missing=[], t_key=t_ob)
 
     # 3) Breaker
     if swp["high"] and dir_bos=="down":
-        _, lv = swp["high"][-1]; entry = lv-0.1*at; sl = lv+0.7*at; tp1, tp2, rr = rr_targets(entry, sl, "short")
-        base = ["SFP high","BOS↓","return"]; generic = gen_conf("short", entry); confirms = base + generic
-        add(name="Breaker", bias="short", etype="stop", trigger=f"возврат под {lv:.5f}",
-            entry=float(entry), sl=float(sl), tp1=float(tp1), tp2=float(tp2), rr=rr,
-            confirms=len(set(confirms)), confirm_list=confirms, explain_short="срыв high и возврат",
-            stop_reason="над свип-уровнем +0.7×ATR", tp_reason="структурная цель/POC",
-            logic_path=["SFP","BOS","ret"], status=("ok" if len(set(base))>=3 else "await"), missing=[])
+        t_s, lv = swp["high"][-1]
+        if (last_idx - t_s) <= pd.Timedelta(minutes=5*max(1, freshS//1)):
+            entry = lv-0.1*at; sl = lv+0.7*at; tp1, tp2, rr = rr_targets(entry, sl, "short")
+            base = ["SFP high","BOS↓","return"]; generic = gen_conf("short", entry); confirms = base + generic
+            add(name="Breaker", bias="short", etype="stop", trigger=f"возврат под {lv:.5f}",
+                entry=float(entry), sl=float(sl), tp1=float(tp1), tp2=float(tp2), rr=rr,
+                confirms=len(set(confirms)), confirm_list=confirms, explain_short="срыв high и возврат",
+                stop_reason="над свип-уровнем +0.7×ATR", tp_reason="структурная цель/POC",
+                logic_path=["SFP","BOS","ret"], status=("ok" if len(set(base))>=3 else "await"), missing=[], t_key=t_s)
 
     if swp["low"] and dir_bos=="up":
-        _, lv = swp["low"][-1]; entry = lv+0.1*at; sl = lv-0.7*at; tp1, tp2, rr = rr_targets(entry, sl, "long")
-        base = ["SFP low","BOS↑","return"]; generic = gen_conf("long", entry); confirms = base + generic
-        add(name="Breaker", bias="long", etype="stop", trigger=f"возврат над {lv:.5f}",
-            entry=float(entry), sl=float(sl), tp1=float(tp1), tp2=float(tp2), rr=rr,
-            confirms=len(set(confirms)), confirm_list=confirms, explain_short="срыв low и возврат",
-            stop_reason="под свип-уровнем −0.7×ATR", tp_reason="структурная цель/POC",
-            logic_path=["SFP","BOS","ret"], status=("ok" if len(set(base))>=3 else "await"), missing=[])
+        t_s, lv = swp["low"][-1]
+        if (last_idx - t_s) <= pd.Timedelta(minutes=5*max(1, freshS//1)):
+            entry = lv+0.1*at; sl = lv-0.7*at; tp1, tp2, rr = rr_targets(entry, sl, "long")
+            base = ["SFP low","BOS↑","return"]; generic = gen_conf("long", entry); confirms = base + generic
+            add(name="Breaker", bias="long", etype="stop", trigger=f"возврат над {lv:.5f}",
+                entry=float(entry), sl=float(sl), tp1=float(tp1), tp2=float(tp2), rr=rr,
+                confirms=len(set(confirms)), confirm_list=confirms, explain_short="срыв low и возврат",
+                stop_reason="под свип-уровнем −0.7×ATR", tp_reason="структурная цель/POC",
+                logic_path=["SFP","BOS","ret"], status=("ok" if len(set(base))>=3 else "await"), missing=[], t_key=t_s)
 
     # 4) Value Area reversion
     if regime=="range" and float(adx(df).iloc[-1]) < 22:
@@ -460,7 +505,7 @@ def propose(df, rules, htf_bias, d_bias, regime, vp, asset, tf) -> List[Scenario
                 entry=float(entry), sl=float(sl), tp1=float(tp1), tp2=float(tp2), rr=rr,
                 confirms=len(set(confirms)), confirm_list=confirms, explain_short="от края к POC",
                 stop_reason="под VAL −0.8×ATR", tp_reason="POC", logic_path=["VAL","range","POC"],
-                status=("ok" if len(set(base))>=3 else "await"), missing=[])
+                status=("ok" if len(set(base))>=3 else "await"), missing=[], t_key=df.index[-1])
 
         if abs(price-vp["vah"]) <= max(0.6*at, 0.1*(vp["vah"]-vp["val"])):
             entry = vp["vah"]-0.1*at; sl = vp["vah"]+0.8*at; tp1, tp2, rr = rr_targets(entry, sl, "short")
@@ -469,14 +514,23 @@ def propose(df, rules, htf_bias, d_bias, regime, vp, asset, tf) -> List[Scenario
                 entry=float(entry), sl=float(sl), tp1=float(tp1), tp2=float(tp2), rr=rr,
                 confirms=len(set(confirms)), confirm_list=confirms, explain_short="от края к POC",
                 stop_reason="над VAH +0.8×ATR", tp_reason="POC", logic_path=["VAH","range","POC"],
-                status=("ok" if len(set(base))>=3 else "await"), missing=[])
+                status=("ok" if len(set(base))>=3 else "await"), missing=[], t_key=df.index[-1])
 
     # сортировка и уникальность
     def _k(s:Scenario):
         sc = s.confirms
         if (s.name.startswith(("SFP→BOS→FVG","BOS→OB","Breaker")) and regime=="trend") or \
            (s.name.startswith("Value Area") and regime=="range"): sc += 1
-        if s.bias == htf_bias: sc += 0.5
+        if s.bias == htf_bias: sc += 0.6
+        if s.bias == d_bias: sc += 0.4
+        # «живость»: моложе — выше
+        age_pen = 0.0
+        if s.t_key is not None:
+            # чем новее, тем выше (в пределах последних 200 баров)
+            idx = df.index.get_indexer([s.t_key])[0]
+            age = len(df) - idx
+            age_pen = max(0.0, 1.0 - age/200.0)
+        sc += age_pen
         return -sc
 
     uniq, seen = [], set()
@@ -489,11 +543,11 @@ def propose(df, rules, htf_bias, d_bias, regime, vp, asset, tf) -> List[Scenario
 
 # ========= Вероятности
 def scenario_probabilities(scen, htf_bias, d_bias, price, vp, atr_val, regime,
-                           cap=0.9, floor=0.05, temp=1.1):
+                           cap=0.9, floor=0.05, temp=1.0):
     if not scen: return {"Wait (no-trade)":100.0}, {"long":0.0,"short":0.0}
     scores, labels = [], []
     for s in scen:
-        sc = 0.7*s.confirms + (1.5 if s.bias==htf_bias else 0) + (1.0 if s.bias==d_bias else 0)
+        sc = 0.7*s.confirms + (1.2 if s.bias==htf_bias else 0) + (0.8 if s.bias==d_bias else 0)
         if (s.name.startswith(("SFP→BOS→FVG","BOS→OB","Breaker")) and regime=="trend") or \
            (s.name.startswith("Value Area") and regime=="range"): sc += 0.8
         dist = abs(s.entry-price)/max(atr_val,1e-6)
@@ -537,8 +591,64 @@ def yf_ohlc_first_success(asset_key, tf, limit=800):
                 last_err = f"{tkr}@{interval}/{period}: {e}"; continue
     raise RuntimeError(f"yfinance: нет данных для {asset_key}. {last_err}")
 
+# ========= Визуализация
+def make_chart(df, vp, gaps_open, swp, dir_bos, t_bos, lvl_bos, ob_info, show_n=300,
+               show_fvg=True, show_sfp=True, show_bos=True, show_ob=True, show_varea=True,
+               title=""):
+    dfv = df.tail(show_n)
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(x=dfv.index, open=dfv.open, high=dfv.high, low=dfv.low, close=dfv.close, name="OHLC"))
+
+    # FVG прямоугольники (только открытые)
+    if show_fvg:
+        for t, lo, hi in gaps_open.get("bull", []):
+            if t < dfv.index[0]: continue
+            fig.add_shape(type="rect", x0=t, x1=dfv.index[-1], y0=lo, y1=hi,
+                          fillcolor="rgba(0,200,0,0.12)", line=dict(width=0))
+        for t, lo, hi in gaps_open.get("bear", []):
+            if t < dfv.index[0]: continue
+            fig.add_shape(type="rect", x0=t, x1=dfv.index[-1], y0=lo, y1=hi,
+                          fillcolor="rgba(200,0,0,0.12)", line=dict(width=0))
+
+    # SFP (свипы)
+    if show_sfp:
+        if swp["high"]:
+            xs = [t for t,_ in swp["high"] if t >= dfv.index[0]]
+            ys = [lvl for _,lvl in swp["high"] if _ >= dfv.index[0]]
+            if xs:
+                fig.add_trace(go.Scatter(x=xs, y=ys, mode="markers", name="SFP High",
+                                         marker=dict(symbol="triangle-down", size=10)))
+        if swp["low"]:
+            xs = [t for t,_ in swp["low"] if t >= dfv.index[0]]
+            ys = [lvl for _,lvl in swp["low"] if _ >= dfv.index[0]]
+            if xs:
+                fig.add_trace(go.Scatter(x=xs, y=ys, mode="markers", name="SFP Low",
+                                         marker=dict(symbol="triangle-up", size=10)))
+
+    # BOS
+    if show_bos and dir_bos and t_bos and t_bos >= dfv.index[0]:
+        fig.add_shape(type="line", x0=dfv.index[0], x1=dfv.index[-1], y0=lvl_bos, y1=lvl_bos,
+                      line=dict(dash="dot", width=1.5))
+        fig.add_vline(x=t_bos, line=dict(dash="dot", width=1), annotation_text=f"BOS {dir_bos}", annotation_position="top right")
+
+    # OB прямоугольник
+    if show_ob and ob_info:
+        t_ob, lo, hi = ob_info
+        x0 = t_ob if t_ob >= dfv.index[0] else dfv.index[0]
+        fig.add_shape(type="rect", x0=x0, x1=dfv.index[-1], y0=lo, y1=hi,
+                      fillcolor="rgba(0,0,200,0.10)", line=dict(width=0), name="OB")
+
+    # VAL/POC/VAH
+    if show_varea:
+        fig.add_hline(y=vp["val"], line=dict(dash="dash", width=1), annotation_text="VAL")
+        fig.add_hline(y=vp["poc"], line=dict(dash="dash", width=1), annotation_text="POC")
+        fig.add_hline(y=vp["vah"], line=dict(dash="dash", width=1), annotation_text="VAH")
+
+    fig.update_layout(title=title, xaxis_rangeslider_visible=False, height=600, margin=dict(l=10,r=10,t=40,b=10))
+    return fig
+
 # ========= UI
-st.set_page_config(page_title="SMC Intraday (text)", layout="wide")
+st.set_page_config(page_title="SMC Intraday (text+chart)", layout="wide")
 db_init(); rules = load_rules()
 
 tab_signals, tab_journal, tab_stats, tab_rules = st.tabs(["📊 Сигналы", "📒 Журнал", "📈 Статистика", "⚙️ Правила"])
@@ -556,7 +666,7 @@ with tab_signals:
     with colG: tg_token = st.text_input("Telegram bot token", value=TG_DEFAULT_TOKEN, type="password")
     with colH: tg_chat  = st.text_input("Telegram chat id", value="")
 
-    st.caption("2 из 3 — показываем как «ожидаем 3»; вход по FVG строго по середине (0.5).")
+    st.caption("Показываем только «живые» зоны (открытые FVG, свежие SFP/BOS). Вход по FVG по середине (0.5).")
 
     if st.button("🔄 Обновить"): st.cache_data.clear(); st.experimental_rerun()
     INTERVALS = {"30s":30, "1m":60, "2m":120, "5m":300}
@@ -569,14 +679,35 @@ with tab_signals:
         st.session_state.next_refresh_ts = time.time()+10**9
 
     try:
-        df, tf_eff, _ = yf_ohlc_first_success(asset, tf, limit=800)
+        df, tf_eff, _ = yf_ohlc_first_success(asset, tf, limit=900)
         htf = HTF_OF[tf]
-        df_h, _, _ = yf_ohlc_first_success(asset, htf, limit=400)
-        df_d, _, _ = yf_ohlc_first_success(asset, "1d", limit=600)
+        df_h, _, _ = yf_ohlc_first_success(asset, htf, limit=500)
+        df_d, _, _ = yf_ohlc_first_success(asset, "1d", limit=700)
 
         price = float(df.close.iloc[-1]); vp = volume_profile(df)
         reg = market_regime(df, vp); atr_v = float(atr(df).iloc[-1])
         htf_bias = score_bias(df_h); d_bias = regime_daily(df_d)
+
+        # Подготовка объектов для графика
+        SH, SL = swings(df); dir_bos, t_bos, lvl_bos = bos(df, SH, SL, look=max(140, rules["windows"]["BOS"]))
+        gaps_open = fvg_open_only(df, fvg(df, look=max(140, rules["windows"]["FVG"])))
+        swp = sweeps(df, SH, SL, win=max(140, rules["windows"]["SFP"]))
+
+        # OB прямоугольник для графика (последний перед BOS)
+        def _ob_for_plot():
+            if not t_bos: return None
+            before = df[df.index < t_bos].iloc[-70:]
+            if dir_bos=="up":
+                reds = before[before.close < before.open]
+                if len(reds):
+                    last = reds.iloc[-1]; return (last.name, float(min(last.open,last.close)), float(max(last.open,last.close)))
+            elif dir_bos=="down":
+                greens = before[before.close > before.open]
+                if len(greens):
+                    last = greens.iloc[-1]; return (last.name, float(min(last.open,last.close)), float(max(last.open,last.close)))
+            return None
+
+        ob_plot = _ob_for_plot()
 
         scen_all = propose(df, rules, htf_bias, d_bias, reg, vp, asset, tf)
 
@@ -599,6 +730,23 @@ with tab_signals:
                     f"Режим: {reg.upper()} (ADX≈{float(adx(df).iloc[-1]):.1f}) • "
                     f"POC {vp['poc']:.5f}, VAL {vp['val']:.5f}, VAH {vp['vah']:.5f} → {poc_state}.")
 
+        # График с разметкой
+        with st.expander("Показать график с разметкой (FVG / SFP / BOS / OB / VAL/POC/VAH)", expanded=True):
+            colc1, colc2, colc3, colc4, colc5 = st.columns(5)
+            with colc1: show_n = st.slider("Баров на графике", 150, 900, 350, step=50)
+            with colc2: show_fvg = st.checkbox("FVG/iFVG", True)
+            with colc3: show_sfp = st.checkbox("SFP (свипы)", True)
+            with colc4: show_bos = st.checkbox("BOS", True)
+            with colc5: show_ob  = st.checkbox("OB", True)
+            show_varea = st.checkbox("VAL/POC/VAH", True)
+            fig = make_chart(
+                df, vp, gaps_open, swp, dir_bos, t_bos, lvl_bos, ob_plot,
+                show_n=show_n, show_fvg=show_fvg, show_sfp=show_sfp, show_bos=show_bos,
+                show_ob=show_ob, show_varea=show_varea,
+                title=f"{asset} {tf} (эфф. {tf_eff})"
+            )
+            st.plotly_chart(fig, use_container_width=True, theme=None)
+
         # Главная карточка
         if scen:
             top_key = list(probs.keys())[0] if probs else f"{scen[0].name} ({scen[0].bias})"
@@ -606,7 +754,7 @@ with tab_signals:
             rr = round(abs(main.tp1-main.entry)/max(abs(main.entry-main.sl),1e-9), 2)
             status_txt = "готов (3/3+)" if (main.confirms>=3 and main.status=="ok") else f"{min(main.confirms,3)}/3 — ждём"
             st.markdown(f"#### {'LONG' if main.bias=='long' else 'SHORT'} — {main.name} — {status_txt}")
-            tp2_str = f"{main.tp2:.6f}" if (main.tp2 is not None and not isinstance(main.tp2, float) or (isinstance(main.tp2,float) and not math.isnan(main.tp2))) else "—"
+            tp2_str = f"{main.tp2:.6f}" if (main.tp2 is not None and not (isinstance(main.tp2,float) and math.isnan(main.tp2))) else "—"
             st.markdown(
                 f"- **Подтв.:** {main.confirms} — {', '.join(main.confirm_list)}  \n"
                 f"- **Вход:** {main.entry:.6f} • **Стоп:** {main.sl:.6f} ({main.stop_reason})  \n"
@@ -683,6 +831,10 @@ with tab_journal:
                 if st.button("Отмена", key=f"cn_{r['id']}"): db_update_trade_status(r['id'], result="cancel"); st.experimental_rerun()
             with c5:
                 if st.button("Закрыть рыночн.", key=f"mk_{r['id']}"): db_update_trade_status(r['id'], result="mkt_close"); st.experimental_rerun()
+        st.markdown("---")
+        if st.download_button("🔽 Экспорт в CSV", data=dfj.to_csv(index=False).encode("utf-8"),
+                              file_name="smc_journal.csv", mime="text/csv"):
+            pass
 
 with tab_stats:
     st.subheader("Краткая статистика по журналу")
@@ -694,39 +846,65 @@ with tab_stats:
         total = len(dfp)
         win = int((dfp["result"]=="tp").sum())
         lose= int((dfp["result"]=="sl").sum())
-        winrate = (win/max(1, win+lose))*100
-        st.write(f"Всего записей: **{total}**, TP: **{win}**, SL: **{lose}**, WinRate: **{winrate:.1f}%**")
-        scenario = dfp.groupby(["name","bias"])["result"].value_counts().unstack(fill_value=0)
-        st.write("Разбивка по сетапам:"); st.dataframe(scenario, use_container_width=True)
-        scenario["total"]   = scenario.sum(axis=1)
-        scenario["winrate"] = (scenario.get("tp",0)/scenario["total"])*100
-        top_scenarios = scenario.sort_values("winrate", ascending=False).head(3)
-        st.write("Наиболее вероятные сценарии (по WinRate):")
-        st.table(top_scenarios[["tp","sl","winrate"]])
+        canc= int((dfp["result"]=="cancel").sum())
+        mktc= int((dfp["result"]=="mkt_close").sum())
+        open_= int((dfp["result"].isna()) | (dfp["result"]=="open"))
+        rr_avg = np.nan
+        try:
+            rr_vals=[]
+            for _,r in dfp.iterrows():
+                risk=abs(r["entry"]-r["sl"])
+                if risk>0 and r["tp1"] is not None and not (isinstance(r["tp1"],float) and math.isnan(r["tp1"])):
+                    rr_vals.append(abs(r["tp1"]-r["entry"])/risk)
+            rr_avg = float(np.nanmean(rr_vals)) if rr_vals else np.nan
+        except Exception:
+            pass
+
+        colS1, colS2, colS3, colS4, colS5 = st.columns(5)
+        with colS1: st.metric("Сделок", total)
+        with colS2: st.metric("TP", win)
+        with colS3: st.metric("SL", lose)
+        with colS4: st.metric("Отменено", canc)
+        with colS5: st.metric("Средн. R:R TP1", f"{rr_avg:.2f}" if not np.isnan(rr_avg) else "—")
+
+        st.markdown("---")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**По активам**")
+            st.dataframe(dfp.groupby("asset")["id"].count().rename("кол-во"), use_container_width=True)
+        with c2:
+            st.markdown("**По стратегиям**")
+            st.dataframe(dfp.groupby("name")["id"].count().rename("кол-во"), use_container_width=True)
 
 with tab_rules:
-    st.subheader("Правила подтверждений")
-    rw = dict(rules)
-    col1,col2,col3 = st.columns(3)
-    with col1:
-        rw["windows"]["SFP"]  = st.number_input("Окно SFP (баров)", 1, 400, int(rw["windows"]["SFP"]))
-        rw["windows"]["BOS"]  = st.number_input("Окно BOS (баров)", 1, 400, int(rw["windows"]["BOS"]))
-    with col2:
-        rw["windows"]["FVG"]  = st.number_input("Окно FVG (баров)", 1, 400, int(rw["windows"]["FVG"]))
-        rw["windows"]["iFVG"] = st.number_input("Окно iFVG (баров)",1, 400, int(rw["windows"]["iFVG"]))
-    with col3:
-        rw["windows"]["BPR"]  = st.number_input("Окно BPR (баров)", 1, 400, int(rw["windows"]["BPR"]))
-        rw["min_depth_atr"]   = st.number_input("Мин глубина по FVG (×ATR)", 0.05, 1.0, float(rw["min_depth_atr"]), step=0.05)
-    st.checkbox("Требовать сторону POC", value=rw["need_poc_side"], key="need_poc_side_chk")
-    rw["need_poc_side"] = st.session_state["need_poc_side_chk"]
-    st.write("Веса (доп. бонусы):")
-    cw = rw["weights"]
-    cw["obv_align"]  = st.number_input("OBV в сторону",  min_value=0.0, max_value=1.5, value=float(cw["obv_align"]),  step=0.1)
-    cw["ema_trend"]  = st.number_input("Тренд EMA20",    min_value=0.0, max_value=1.5, value=float(cw["ema_trend"]),  step=0.1)
-    cw["poc_side"]   = st.number_input("Сторона POC",    min_value=0.0, max_value=1.5, value=float(cw["poc_side"]),   step=0.1)
-    cw["vwap_near"]  = st.number_input("Рядом VWAP",     min_value=0.0, max_value=1.5, value=float(cw["vwap_near"]),  step=0.1)
-    cw["divergence"] = st.number_input("RSI дивергенция",min_value=0.0, max_value=1.5, value=float(cw["divergence"]), step=0.1)
-    rw["min_confirms"]= st.number_input("Мин. подтверждений по умолчанию", min_value=2, max_value=5,
-                                        value=int(rw.get("min_confirms",3)), step=1)
-    if st.button("💾 Сохранить правила"):
-        save_rules(rw); st.success("Сохранено. Обнови вкладку Сигналы при необходимости.")
+    st.subheader("Правила подтверждений / окна / свежесть")
+    cfg = load_rules()
+    with st.form("rules_form"):
+        c1,c2,c3,c4,c5 = st.columns(5)
+        with c1:
+            cfg["windows"]["SFP"] = st.number_input("Окно SFP (баров)", 60, 400, cfg["windows"]["SFP"], step=10)
+        with c2:
+            cfg["windows"]["BOS"] = st.number_input("Окно BOS (баров)", 60, 400, cfg["windows"]["BOS"], step=10)
+        with c3:
+            cfg["windows"]["FVG"] = st.number_input("Окно FVG (баров)", 60, 400, cfg["windows"]["FVG"], step=10)
+        with c4:
+            cfg["min_depth_atr"] = st.number_input("Мин. глубина от mid (×ATR)", 0.1, 1.0, cfg["min_depth_atr"], step=0.05)
+        with c5:
+            cfg["impulse_mult"] = st.number_input("Импульс бар (×ATR)", 1.0, 2.5, cfg["impulse_mult"], step=0.05)
+
+        c6,c7,c8 = st.columns(3)
+        with c6:
+            cfg["fresh_bars"]["SFP"] = st.number_input("Свежесть SFP (баров)", 40, 400, cfg["fresh_bars"]["SFP"], step=10)
+        with c7:
+            cfg["fresh_bars"]["BOS"] = st.number_input("Свежесть BOS (баров)", 40, 400, cfg["fresh_bars"]["BOS"], step=10)
+        with c8:
+            cfg["fresh_bars"]["FVG"] = st.number_input("Свежесть FVG (баров)", 40, 400, cfg["fresh_bars"]["FVG"], step=10)
+
+        cfg["need_poc_side"] = st.checkbox("Требовать сторону POC", value=cfg["need_poc_side"])
+        cfg["vol_spike_mult"] = st.number_input("Множитель всплеска объёма (к EMA20)", 1.0, 3.0, cfg["vol_spike_mult"], step=0.1)
+        cfg["min_confirms"] = st.number_input("Мин. подтверждений для готовности", 2, 5, cfg["min_confirms"], step=1)
+
+        submitted = st.form_submit_button("💾 Сохранить")
+        if submitted:
+            save_rules(cfg)
+            st.success("Сохранено. Обнови «Сигналы», чтобы применить.")
